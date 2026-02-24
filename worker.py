@@ -11,9 +11,11 @@ Sequential processing (maxReplicas=1) means only one PDF is tiled at a time,
 so memory usage is predictable and OOM crashes are impossible.
 
 Required environment variables:
-  PRODUCTION_STORAGE_CONNECTION_STRING  - queue storage (tiling-jobs queue lives here)
-  TILING_QUEUE_NAME                     - queue name (default: tiling-jobs)
-  AZURE_STORAGE_CONNECTION_STRING       - test blob storage
+  AZURE_STORAGE_CONNECTION_STRING       - queue storage + test blob storage
+                                          ("tileservice" queue must exist here)
+  PRODUCTION_STORAGE_CONNECTION_STRING  - fallback if AZURE_STORAGE_CONNECTION_STRING is absent;
+                                          also used for production blob uploads
+  TILING_QUEUE_NAME                     - queue name (default: tileservice)
   PRODUCTION_STORAGE_ACCOUNT_NAME       - production account name
   TEST_STORAGE_ACCOUNT_NAME             - test account name
   HASURA_GRAPHQL_URL                    - for tiling status updates
@@ -32,8 +34,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-QUEUE_STORAGE_CONNECTION_STRING = os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")
-TILING_QUEUE_NAME = os.environ.get("TILING_QUEUE_NAME", "tiling-jobs")
+# Prefer AZURE_STORAGE_CONNECTION_STRING (same account the API enqueues to),
+# fall back to PRODUCTION_STORAGE_CONNECTION_STRING for backwards compatibility.
+QUEUE_STORAGE_CONNECTION_STRING = (
+    os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    or os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")
+)
+TILING_QUEUE_NAME = os.environ.get("TILING_QUEUE_NAME", "tileservice")
 
 # Shut down after this many consecutive empty polls (KEDA will restart when needed)
 EMPTY_POLL_LIMIT = 3
@@ -42,11 +49,12 @@ EMPTY_POLL_WAIT_SECONDS = 10
 
 def main():
     if not QUEUE_STORAGE_CONNECTION_STRING:
-        logger.error("❌ PRODUCTION_STORAGE_CONNECTION_STRING not set")
+        logger.error("❌ AZURE_STORAGE_CONNECTION_STRING (or PRODUCTION_STORAGE_CONNECTION_STRING) not set")
         sys.exit(1)
 
     # Lazy import: avoids loading heavy deps (PIL, PyMuPDF) if env is misconfigured
     from azure.storage.queue import QueueServiceClient
+
     from app import process_floorplan_sync, update_tiling_status
 
     queue_service = QueueServiceClient.from_connection_string(QUEUE_STORAGE_CONNECTION_STRING)
