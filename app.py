@@ -161,7 +161,7 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         logger.info(f"✅ Updated tiling status for file_id={file_id}: '{status_value}'")
         
     except Exception as e:
-        logger.error(f"Error updating tiling status for file_id={file_id}: {str(e)}")
+        logger.error(f"❌ Hasura update failed for file_id={file_id}: {str(e)}")
 
 
 # Job status tracking
@@ -219,11 +219,8 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
         List of PIL Image objects, one per page
     """
     try:
-        logger.info(f"Starting PDF conversion at scale {scale}x")
-
         # Open PDF from bytes
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
-        logger.info(f"PDF loaded: {pdf_document.page_count} page(s)")
 
         images = []
 
@@ -251,8 +248,6 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
                 target_width = int(width_pt * actual_scale)
                 target_height = int(height_pt * actual_scale)
 
-                logger.info(f"Adjusted scale to {actual_scale:.2f}x, new dimensions: {target_width}x{target_height}")
-
             # Create transformation matrix for scaling
             mat = fitz.Matrix(actual_scale, actual_scale)
 
@@ -264,8 +259,6 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
             pil_image = Image.open(io.BytesIO(img_data))
 
             images.append(pil_image)
-
-            logger.info(f"Page {page_num + 1}: {pil_image.width}x{pil_image.height} pixels, aspect ratio: {pil_image.width/pil_image.height:.2f}:1")
 
         pdf_document.close()
 
@@ -314,9 +307,7 @@ class SimpleFloorplanTiler:
             pyramid[zoom] = tiles
             tile_count = len(tiles)
             total_tiles += tile_count
-            logger.info(f"Generated {tile_count} tiles for zoom level {zoom}")
 
-        logger.info(f"Total tiles generated: {total_tiles} across {len(zoom_levels)} zoom levels")
         return pyramid
 
     def _generate_zoom_level(self,
@@ -434,7 +425,6 @@ def trim_whitespace(
         bbox = mask.getbbox()
 
         if not bbox:
-            logger.info("Whitespace trim: no content bbox found; returning original image")
             return image
 
         # Expand bbox by padding, clamped to image bounds
@@ -445,11 +435,9 @@ def trim_whitespace(
         bottom = min(img.height, bottom + padding)
 
         if left == 0 and top == 0 and right == img.width and bottom == img.height:
-            logger.info("Whitespace trim: bbox equals full image; nothing to crop")
             return image
 
         cropped = img.crop((left, top, right, bottom))
-        logger.info(f"Whitespace trim: cropped from {img.width}x{img.height} to {cropped.width}x{cropped.height}")
         return cropped
     except Exception as e:
         logger.warning(f"Whitespace trim failed: {e}")
@@ -531,15 +519,12 @@ def upload_tiles_to_blob(
         connection_string: Azure Storage connection string
         container: Container name (default: "blocks")
     """
-    logger.info(f"Uploading tiles to blob storage: {container}/floorplans/{floorplan_id}/")
-
     blob_service = BlobServiceClient.from_connection_string(connection_string)
     container_client = blob_service.get_container_client(container)
 
     # Container should already exist (floor-plans)
     try:
         container_client.get_container_properties()
-        logger.info(f"Using existing container: {container}")
     except Exception as e:
         logger.warning(f"Container check failed: {str(e)}")
 
@@ -551,7 +536,6 @@ def upload_tiles_to_blob(
         overwrite=True,
         content_settings=ContentSettings(content_type="application/json")
     )
-    logger.info(f"Uploaded metadata: {metadata_blob}")
 
     # Upload preview
     preview_bytes = io.BytesIO()
@@ -563,7 +547,6 @@ def upload_tiles_to_blob(
         overwrite=True,
         content_settings=ContentSettings(content_type="image/jpeg")
     )
-    logger.info(f"Uploaded preview image")
 
     # Upload optimized base image (optional)
     if base_image_data is not None:
@@ -578,7 +561,6 @@ def upload_tiles_to_blob(
                 content_settings=ContentSettings(content_type=content_type)
             )
             size_mb = len(base_image_data) / (1024*1024)
-            logger.info(f"Uploaded optimized base image: {base_filename} ({size_mb:.2f} MB, {base_image_format.upper()})")
         except Exception as be:
             logger.warning(f"Failed to upload base image: {be}")
 
@@ -603,10 +585,6 @@ def upload_tiles_to_blob(
             )
 
             uploaded += 1
-            if uploaded % 50 == 0 or uploaded == total_tiles:
-                logger.info(f"Upload progress: {uploaded}/{total_tiles} tiles")
-
-    logger.info(f"✅ Successfully uploaded {total_tiles} tiles for {floorplan_id}")
 
 
 def extract_floorplan_id(blob_name: str) -> str:
@@ -665,8 +643,6 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
     Returns:
         JSON response with deletion status
     """
-    logger.info(f"Received delete request for file_id={file_id}")
-
     try:
         # Get storage connection
         connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
@@ -681,7 +657,6 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
 
         # Find all blobs matching the pattern
         prefix = f"floorplans/{file_id}/"
-        logger.info(f"Searching for blobs with prefix: {prefix}")
 
         existing_blobs = container_client.list_blobs(name_starts_with=prefix)
         blobs_to_delete = []
@@ -690,7 +665,6 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
             blobs_to_delete.append(blob.name)
 
         if not blobs_to_delete:
-            logger.info(f"No floorplans found for {file_id}")
             return {
                 "success": True,
                 "message": "No floorplans found to delete",
@@ -699,7 +673,6 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
             }
 
         # Delete all matching blobs
-        logger.info(f"Deleting {len(blobs_to_delete)} blobs for {file_id}")
         deleted_count = 0
         failed_deletions = []
 
@@ -707,7 +680,6 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
             try:
                 container_client.delete_blob(blob_name)
                 deleted_count += 1
-                logger.info(f"Deleted: {blob_name}")
             except Exception as del_err:
                 logger.error(f"Failed to delete {blob_name}: {del_err}")
                 failed_deletions.append(blob_name)
@@ -722,7 +694,6 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
                 "failed_count": len(failed_deletions)
             }
 
-        logger.info(f"✅ Successfully deleted all floorplans for {file_id}")
         return {
             "success": True,
             "message": "All floorplans deleted successfully",
@@ -751,8 +722,6 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
     Returns:
         JSON response with deletion results for each item
     """
-    logger.info(f"Received mass delete request for {len(request.file_ids)} items")
-
     try:
         # Get storage connection
         connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
@@ -772,13 +741,11 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
             try:
                 # Find all blobs matching the pattern
                 prefix = f"floorplans/{file_id}/"
-                logger.info(f"Searching for blobs with prefix: {prefix}")
 
                 existing_blobs = container_client.list_blobs(name_starts_with=prefix)
                 blobs_to_delete = [blob.name for blob in existing_blobs]
 
                 if not blobs_to_delete:
-                    logger.info(f"No floorplans found for {file_id}")
                     results.append({
                         "file_id": file_id,
                         "success": True,
@@ -788,7 +755,6 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
                     continue
 
                 # Delete all matching blobs
-                logger.info(f"Deleting {len(blobs_to_delete)} blobs for {file_id}")
                 deleted_count = 0
                 failed_deletions = []
 
@@ -797,7 +763,6 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
                         container_client.delete_blob(blob_name)
                         deleted_count += 1
                         total_deleted += 1
-                        logger.info(f"Deleted: {blob_name}")
                     except Exception as del_err:
                         logger.error(f"Failed to delete {blob_name}: {del_err}")
                         failed_deletions.append(blob_name)
@@ -817,7 +782,6 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
                         "deleted_count": deleted_count,
                         "message": "All floorplans deleted successfully"
                     })
-                    logger.info(f"✅ Successfully deleted all floorplans for {file_id}")
 
             except Exception as item_err:
                 logger.error(f"Error deleting {file_id}: {str(item_err)}")
@@ -831,8 +795,6 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
         # Summary
         successful_items = sum(1 for r in results if r["success"])
         failed_items = len(results) - successful_items
-
-        logger.info(f"✅ Mass deletion completed: {total_deleted} total blobs deleted, {successful_items}/{len(results)} items successful")
 
         return {
             "success": failed_items == 0,
@@ -910,8 +872,6 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
     Returns:
         JSON response with job_id for tracking progress
     """
-    logger.info(f"Received floorplan processing request: {request.file_url}")
-
     # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
@@ -936,8 +896,6 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
     # Start background processing
     background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id, request.environment)
 
-    logger.info(f"Job {job_id} queued for processing (environment: {request.environment})")
-
     return {
         "job_id": job_id,
         "status": JobStatus.QUEUED,
@@ -961,7 +919,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
         Result dictionary with floorplan info
     """
     update_job_progress(job_id, 5, "Downloading PDF...")
-    logger.info(f"Job {job_id}: Processing floorplan from URL: {file_url} (environment: {environment})")
 
     # Determine storage configuration based on environment
     if environment.lower() == "production":
@@ -972,7 +929,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             )
         connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
         storage_account_name = PRODUCTION_STORAGE_ACCOUNT_NAME
-        logger.info(f"Using PRODUCTION storage account: {storage_account_name}")
     else:
         if not TEST_STORAGE_CONNECTION_STRING:
             raise HTTPException(
@@ -981,7 +937,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             )
         connection_string = TEST_STORAGE_CONNECTION_STRING
         storage_account_name = TEST_STORAGE_ACCOUNT_NAME
-        logger.info(f"Using TEST storage account: {storage_account_name}")
 
     try:
         # Download the PDF from Azure Blob Storage or URL
@@ -997,15 +952,11 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 container_name = path_parts[0]
                 blob_name = path_parts[1] if len(path_parts) > 1 else ''
 
-                logger.info(f"Downloading from Azure Blob: account={source_storage_account}, container={container_name}, blob={blob_name}")
-
                 # Determine which connection string to use based on source storage account
                 if source_storage_account.lower() == PRODUCTION_STORAGE_ACCOUNT_NAME.lower() if PRODUCTION_STORAGE_ACCOUNT_NAME else False:
                     download_connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
-                    logger.info(f"Using PRODUCTION storage credentials to download source file")
                 else:
                     download_connection_string = TEST_STORAGE_CONNECTION_STRING
-                    logger.info(f"Using TEST storage credentials to download source file")
 
                 if not download_connection_string:
                     raise Exception(f"Storage connection string not configured for source account: {source_storage_account}")
@@ -1013,14 +964,12 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 blob_service = BlobServiceClient.from_connection_string(download_connection_string)
                 blob_client = blob_service.get_blob_client(container_name, blob_name)
                 file_content = blob_client.download_blob().readall()
-                logger.info(f"Downloaded PDF from blob storage: {len(file_content)} bytes")
                 update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
             else:
                 # Download from external URL
                 import urllib.request
                 with urllib.request.urlopen(file_url) as response:
                     file_content = response.read()
-                logger.info(f"Downloaded PDF from URL: {len(file_content)} bytes")
                 update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
         except Exception as download_error:
             logger.error(f"Error downloading file: {str(download_error)}", exc_info=True)
@@ -1036,7 +985,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 status_code=400,
                 detail=f"PDF file too large ({file_size_mb:.1f}MB). Maximum allowed size is 100MB."
             )
-        logger.info(f"PDF size validation passed: {file_size_mb:.2f}MB")
 
         # Extract filename from URL
         from urllib.parse import urlparse
@@ -1085,8 +1033,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 }
             }
 
-        logger.info(f"No existing floorplans found for file_id {file_id}, proceeding with new floorplan")
-
         # Create a mock blob name for compatibility
         myblob_name = f"blocks/{floorplan_name}"
 
@@ -1122,7 +1068,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             container_and_rest = myblob_name.split('/', 1)
             relative_path = container_and_rest[1] if len(container_and_rest) > 1 else myblob_name
             if '/' in relative_path:
-                logger.info(f"Ignoring nested PDF '{relative_path}' to prevent re-processing loop.")
                 return JSONResponse(
                     content={"success": True, "message": "Skipped nested PDF to prevent re-processing"},
                     status_code=200
@@ -1130,24 +1075,14 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
         except Exception as _:
             pass
 
-        logger.info(f"Processing PDF file: {myblob_name}")
-
         # Validate TILE_SIZE to supported values
         if TILE_SIZE_ENV not in (128, 256, 512, 1024):
             logger.warning(f"Unsupported TILE_SIZE={TILE_SIZE_ENV}; defaulting to 256")
             TILE_SIZE_ENV = 256
 
-        logger.info(
-            "Configuration overrides → "
-            f"PDF_SCALE={PDF_SCALE}, MAX_DIMENSION={MAX_DIMENSION}, "
-            f"MAX_ZOOM_LIMIT={MAX_ZOOM_LIMIT}, FORCED_MAX_Z={FORCED_MAX_Z_ENV}, "
-            f"ZOOM_BOOST={ZOOM_BOOST}, TILE_SIZE={TILE_SIZE_ENV}, MIN_ZOOM={MIN_ZOOM_ENV}"
-        )
-
         # SMART SCALING: Analyze PDF characteristics and determine optimal scale
         # Check file size - simple documents are small, complex floorplans are large
         file_size_mb = len(file_content) / (1024 * 1024)
-        logger.info(f"PDF file size: {file_size_mb:.2f} MB")
 
         # Open PDF to check dimensions and calculate appropriate quality
         pdf_document = fitz.open(stream=file_content, filetype="pdf")
@@ -1165,11 +1100,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             # Calculate aspect ratio
             aspect_ratio = max(width_inches, height_inches) / min(width_inches, height_inches)
 
-            logger.info(
-                f"PDF page size: {width_inches:.1f}\" × {height_inches:.1f}\" "
-                f"({width_pt:.0f} × {height_pt:.0f} pt), aspect ratio: {aspect_ratio:.2f}:1"
-            )
-
             # Quick content analysis: Check if page has embedded images (raster content)
             has_images = False
             image_count = 0
@@ -1177,19 +1107,11 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 image_list = page.get_images(full=False)
                 image_count = len(image_list)
                 has_images = image_count > 0
-                if has_images:
-                    logger.info(f"PDF contains {image_count} embedded image(s) - likely a scanned floorplan")
-                else:
-                    logger.info("PDF is pure vector - likely a CAD drawing")
             except Exception:
                 pass
 
             # File size heuristic: Small files are simple documents, large files are complex plans
             is_complex_plan = file_size_mb > 0.5  # Files over 500KB are likely detailed plans
-            if is_complex_plan:
-                logger.info(f"Large file size ({file_size_mb:.2f} MB) indicates complex/detailed content")
-            else:
-                logger.info(f"Small file size ({file_size_mb:.2f} MB) indicates simple document")
 
             # INTELLIGENT SCALE SELECTION based on document characteristics
             # Large architectural plans need high DPI for deep zoom
@@ -1257,18 +1179,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 target_scale = target_scale * area_scale
                 reason += " (reduced for memory safety)"
 
-            if target_scale != PDF_SCALE:
-                logger.info(
-                    f"Smart scaling: Adjusted from {PDF_SCALE}x to {target_scale:.1f}x "
-                    f"for {reason}. Will create {int(width_pt * target_scale)}×{int(height_pt * target_scale)} "
-                    f"({int(width_pt * target_scale * height_pt * target_scale):,} pixels) at {target_scale * 72:.0f} DPI"
-                )
-            else:
-                logger.info(
-                    f"Using full scale {PDF_SCALE}x for {reason}. "
-                    f"Will create {potential_width}×{potential_height} ({potential_pixels:,} pixels) at {PDF_SCALE * 72:.0f} DPI"
-                )
-
             PDF_SCALE = target_scale
 
         pdf_document.close()
@@ -1282,7 +1192,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
 
         # Use first page (floor plans should be single page)
         floor_plan_image = images[0]
-        logger.info(f"Floor plan dimensions (pre-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels")
         update_job_progress(job_id, 20, "PDF converted, preparing image...")
 
         # Release extra images from memory immediately
@@ -1297,9 +1206,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
         # Release original image if trim created a new one
         if original_image is not floor_plan_image:
             original_image.close()
-            logger.info(f"Floor plan dimensions (post-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels (original released)")
-        else:
-            logger.info(f"Floor plan dimensions (no trim needed): {floor_plan_image.width}x{floor_plan_image.height} pixels")
 
         # 2. Calculate optimal zoom levels for Leaflet tiles
         tile_size = TILE_SIZE_ENV
@@ -1329,48 +1235,26 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             
             boosted_zoom = optimal_zoom + adaptive_boost
             max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
-
-            logger.info(
-                f"🎯 Auto-calculated max zoom: {max_zoom} "
-                f"(native optimal: {optimal_zoom}, adaptive boost: +{adaptive_boost}, "
-                f"image {floor_plan_image.width}x{floor_plan_image.height}, "
-                f"max_dim={max_dim})"
-            )
         else:
             # Use forced max zoom from environment
             max_zoom = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
-            logger.info(f"Using forced max zoom: {max_zoom}")
 
         min_zoom = max(0, min(MIN_ZOOM_ENV, max_zoom))
         total_levels = (max_zoom - min_zoom + 1)
-        logger.info(f"Using Leaflet zoom levels: {min_zoom}-{max_zoom} (total {total_levels})")
-
-        # Log native tile density at highest zoom
-        native_tiles_x = math.ceil(floor_plan_image.width / (tile_size * 2**(max_zoom)))
-        native_tiles_y = math.ceil(floor_plan_image.height / (tile_size * 2**(max_zoom)))
-        native_total_tiles = native_tiles_x * native_tiles_y
-        logger.info(
-            "Max-zoom native tile grid: "
-            f"{native_tiles_x}x{native_tiles_y} (total {native_total_tiles}) at {floor_plan_image.width}x{floor_plan_image.height}px"
-        )
 
         # 3. Generate tile pyramid using Simple CRS
-        logger.info("🗺️ Generating Simple CRS tile pyramid with high quality...")
         update_job_progress(job_id, 30, f"Generating {total_levels} zoom levels of tiles...")
 
         zoom_levels = list(range(min_zoom, max_zoom + 1))
         floorplan_tiler = SimpleFloorplanTiler(tile_size=tile_size)
         pyramid = floorplan_tiler.tile_image(floor_plan_image, zoom_levels)
         total_tiles = sum(len(tiles) for tiles in pyramid.values())
-        logger.info(f"Generated {total_tiles} high-quality tiles across {len(pyramid)} zoom levels")
         update_job_progress(job_id, 60, f"Generated {total_tiles} tiles, uploading to storage...")
 
         # 4. Generate preview image
-        logger.info("Generating preview image...")
         preview = generate_preview(floor_plan_image, max_width=800)
 
         # Skip base image to save memory - tiles are sufficient
-        logger.info("⚠️ Skipping base image save to conserve memory for large floorplans")
 
         # 5. Create metadata
         metadata = create_metadata(
@@ -1388,10 +1272,8 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             "max_dimension": MAX_DIMENSION,
             "dpi": PDF_SCALE * 72
         }
-        logger.info(f"Created metadata for floor plan: {floorplan_id}")
 
         # 6. Upload to blob storage
-        logger.info("Uploading tiles and assets to blob storage...")
         upload_tiles_to_blob(
             pyramid=pyramid,
             preview=preview,
@@ -1412,7 +1294,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             for _, _, tile_img in zoom_tiles:
                 tile_img.close()
         pyramid.clear()
-        logger.info("✅ Cleaned up image memory after upload")
 
         # 7. Archive the original PDF
         blob_service = BlobServiceClient.from_connection_string(connection_string)
@@ -1423,17 +1304,10 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             dest_client = blob_service.get_blob_client(source_container, dest_blob_name)
             content_settings = ContentSettings(content_type="application/pdf")
             dest_client.upload_blob(file_content, overwrite=True, content_settings=content_settings)
-            logger.info(f"Archived original PDF at: {dest_blob_name}")
         except Exception as copy_err:
             logger.warning(f"Could not store archived PDF copy: {str(copy_err)}")
 
         update_job_progress(job_id, 95, "Finalizing floor plan processing...")
-
-        logger.info(f"🚀 Successfully created tiled floor plan: {floorplan_id}")
-        logger.info(f"   📐 Dimensions: {floor_plan_image.width}x{floor_plan_image.height}px")
-        logger.info(f"   🎨 Quality: {PDF_SCALE * 72:.0f} DPI (PDF_SCALE={PDF_SCALE})")
-        logger.info(f"   ️ Zoom levels: {total_levels} ({min_zoom}-{max_zoom})")
-        logger.info(f"   🏗️ Total tiles: {total_tiles}")
 
         # Return success response
         return {
