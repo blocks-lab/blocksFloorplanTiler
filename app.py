@@ -17,7 +17,7 @@ import fitz  # PyMuPDF
 import httpx
 import uvicorn
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from fastapi import (Depends, FastAPI, Header, HTTPException, Request)
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request)
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageChops
 from pydantic import BaseModel
@@ -884,19 +884,42 @@ def update_job_progress(job_id: str, progress: int, message: str):
     logger.info(f"Job {job_id} progress: {progress}% - {message}")
 
 
+def process_floorplan_background(file_url: str, job_id: str, file_id: int, environment: str):
+    """Background task to process the floorplan - runs in dedicated container"""
+    try:
+        # 1️⃣ START: Update Hasura status
+        update_tiling_status(file_id, "Tiling running")
+
+        # Process the floorplan
+        result = process_floorplan_sync(file_url, job_id, file_id, environment)
+        
+        # 2️⃣ SUCCESS: Update Hasura status
+        update_tiling_status(file_id, "Tiling finished")
+        
+        logger.info(f"✅ Job {job_id} completed successfully for file_id={file_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Job {job_id} failed: {str(e)}", exc_info=True)
+        
+        # 3️⃣ ERROR: Update Hasura status
+        update_tiling_status(file_id, "Error", error_message=str(e))
+
+
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
+async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Process a PDF floorplan synchronously (one container per request).
+    Trigger floorplan tiling - returns immediately, processing continues in background.
     
-    Each HTTP request runs in its own container instance.
-    Azure Container Apps scales out automatically based on HTTP load.
+    With concurrency=1, each request gets its own isolated container.
+    The background task runs in that dedicated container with full resources.
+    
+    Status updates are sent to Hasura tiling-status field.
 
     Args:
         request: ProcessFloorplanRequest with file_url, file_id, environment
 
     Returns:
-        JSON response with floorplan metadata and tile information
+        JSON response confirming the job was queued
     """
     # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
@@ -904,33 +927,24 @@ async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: boo
 
     # Generate job ID for logging
     job_id = str(uuid.uuid4())
-    logger.info(f"Processing floorplan job {job_id} for file_id={request.file_id}")
+    logger.info(f"🚀 Queuing floorplan job {job_id} for file_id={request.file_id}")
 
-    try:
-        # 1️⃣ START: Update Hasura status
-        update_tiling_status(request.file_id, "Tiling running")
+    # Queue background processing in this container
+    background_tasks.add_task(
+        process_floorplan_background,
+        request.file_url,
+        job_id,
+        request.file_id,
+        request.environment
+    )
 
-        # Process synchronously - this container is dedicated to this request
-        result = process_floorplan_sync(request.file_url, job_id, request.file_id, request.environment)
-        
-        # 2️⃣ SUCCESS: Update Hasura status
-        update_tiling_status(request.file_id, "Tiling finished")
-        
-        return result
-
-    except HTTPException:
-        # Re-raise HTTP exceptions (they already have proper status codes)
-        raise
-    except Exception as e:
-        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
-        
-        # 3️⃣ ERROR: Update Hasura status
-        update_tiling_status(request.file_id, "Error", error_message=str(e))
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)}"
-        )
+    # Return immediately - processing continues in background
+    return {
+        "success": True,
+        "job_id": job_id,
+        "file_id": request.file_id,
+        "message": "Tiling job queued. Check Hasura tiling-status for progress."
+    }
 
 
 def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment: str = "test"):
