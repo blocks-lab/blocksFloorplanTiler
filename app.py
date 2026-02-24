@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import os
-import threading
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -18,7 +17,7 @@ import httpx
 import uvicorn
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request)
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageChops
 from pydantic import BaseModel
 
@@ -243,10 +242,10 @@ class JobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
-# Prevents 2 tiling jobs from running simultaneously on the same container instance.
-# If a second request lands on a busy container before Azure CA scales out,
-# it fails fast so the caller can retry (and hit a fresh container).
-_container_tiling_lock = threading.Semaphore(1)
+# True while a tiling job is running on this container instance.
+# The /health readiness probe returns 503 when this is True, which tells
+# Azure CA's load balancer to stop routing ALL new requests here.
+_is_tiling = False
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -682,7 +681,11 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Kubernetes/Container Apps health probe"""
+    """Readiness probe - returns 503 while tiling is active.
+    Azure CA stops routing new requests to this container when 503 is returned.
+    """
+    if _is_tiling:
+        return JSONResponse(status_code=503, content={"status": "busy", "reason": "tiling in progress"})
     return {"status": "healthy"}
 
 
@@ -890,16 +893,9 @@ def update_job_progress(job_id: str, progress: int, message: str):
 
 
 def process_floorplan_background(file_url: str, job_id: str, file_id: int, environment: str):
-    """Background task to process the floorplan - runs in dedicated container"""
-    # Prevent 2 heavy tiling jobs from running concurrently on the same container.
-    # Non-blocking: if a job is already running here, fail fast so the caller can retry
-    # on a fresh container (Azure CA will have scaled out by then).
-    acquired = _container_tiling_lock.acquire(blocking=False)
-    if not acquired:
-        logger.warning(f"⚠️ Container already busy with a tiling job. Rejecting job {job_id} for file_id={file_id}. Caller should retry.")
-        update_tiling_status(file_id, "Error", error_message="Container busy with another tiling job. Please retry in a few seconds.")
-        return
-
+    """Background task to process the floorplan.
+    _is_tiling is already True (set by the endpoint) - reset to False when done.
+    """
     try:
         # 1️⃣ START: Update Hasura status
         update_tiling_status(file_id, "Tiling running")
@@ -919,7 +915,8 @@ def process_floorplan_background(file_url: str, job_id: str, file_id: int, envir
         update_tiling_status(file_id, "Error", error_message=str(e))
 
     finally:
-        _container_tiling_lock.release()
+        _is_tiling = False
+        logger.info(f"🔓 Container released (file_id={file_id}) - readiness probe now returns 200")
 
 
 @app.post("/api/process-floorplan")
@@ -942,9 +939,29 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
     if not request.file_url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
 
+    # If this container is already tiling, the readiness probe is already returning 503
+    # so Azure CA shouldn't route here — but reject just in case of a race condition.
+    if _is_tiling:
+        logger.warning(f"⚠️ Container busy, rejecting request for file_id={request.file_id}")
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "10"},
+            content={
+                "success": False,
+                "error": "container_busy",
+                "message": "Container is busy tiling. Azure CA will retry on a fresh container."
+            }
+        )
+
     # Generate job ID for logging
     job_id = str(uuid.uuid4())
     logger.info(f"🚀 Queuing floorplan job {job_id} for file_id={request.file_id}")
+
+    # Mark container as busy BEFORE queuing the task.
+    # This means /health returns 503 immediately - no race condition window.
+    global _is_tiling
+    _is_tiling = True
+    logger.info(f"🔒 Container marked busy - readiness probe now returns 503")
 
     # Queue background processing in this container
     background_tasks.add_task(
