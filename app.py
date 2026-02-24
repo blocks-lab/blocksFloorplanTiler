@@ -7,16 +7,18 @@ import json
 import logging
 import math
 import os
+import threading
 import uuid
 from datetime import datetime
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import httpx
 import uvicorn
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from azure.storage.queue import QueueServiceClient
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
+                     Request)
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageChops
 from pydantic import BaseModel
@@ -44,13 +46,6 @@ TEST_STORAGE_ACCOUNT_NAME = os.environ.get("TEST_STORAGE_ACCOUNT_NAME", "blocksp
 
 PRODUCTION_STORAGE_CONNECTION_STRING = os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")  # Production storage
 PRODUCTION_STORAGE_ACCOUNT_NAME = os.environ.get("PRODUCTION_STORAGE_ACCOUNT_NAME")  # Production account name
-
-# Queue storage — tiling jobs are sent to the "tileservice" queue here
-# Falls back to the test connection string when running locally
-QUEUE_STORAGE_CONNECTION_STRING = (
-    os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-    or os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")
-)
 
 def verify_api_key(x_api_key: str = Header(None)):
     """Verify the API key from request header"""
@@ -88,44 +83,12 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         return
 
     try:
-        # Step 1: Find the "tiling-status" information_id (MUST exist)
-        find_info_query = """
-        query FindTilingStatusInformation {
-          information(where: {name: {_eq: "tiling-status"}}) {
-            id
-          }
-        }
-        """
-
-        info_response = httpx.post(
-            HASURA_GRAPHQL_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-hasura-admin-secret": HASURA_ADMIN_SECRET
-            },
-            json={"query": find_info_query},
-            timeout=10.0
-        )
-        info_response.raise_for_status()
-        info_data = info_response.json()
-
-        if "errors" in info_data:
-            logger.error(f"Hasura query error: {info_data['errors']}")
-            return
-
-        info_records = info_data.get("data", {}).get("information", [])
-        if not info_records:
-            logger.error("'tiling-status' information type not found in database. It MUST be created manually first.")
-            return
-
-        information_id = info_records[0]["id"]
-
-        # Step 2: Find the files_information record
+        # Find the tiling-status record
         find_query = """
-        query FindTilingStatusInfo($files_id: Int!, $information_id: Int!) {
+        query FindTilingStatusInfo($files_id: Int!) {
           files_information(where: {
             files_id: {_eq: $files_id}
-            information_id: {_eq: $information_id}
+            information: {name: {_eq: "tiling-status"}}
           }) {
             id
           }
@@ -140,7 +103,7 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
             },
             json={
                 "query": find_query,
-                "variables": {"files_id": file_id, "information_id": information_id}
+                "variables": {"files_id": file_id}
             },
             timeout=10.0
         )
@@ -153,48 +116,7 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
 
         records = find_data.get("data", {}).get("files_information", [])
         if not records:
-            # Auto-create the tiling-status record if it doesn't exist
-            logger.info(f"Creating tiling-status record for file_id={file_id}")
-            create_mutation = """
-            mutation CreateTilingStatus($files_id: Int!, $information_id: Int!, $value: String!) {
-              insert_files_information_one(object: {
-                files_id: $files_id
-                information_id: $information_id
-                value: $value
-              }) {
-                id
-              }
-            }
-            """
-
-            status_value = status
-            if error_message and status == "Error":
-                status_value = f"{status}: {error_message[:200]}"
-
-            create_response = httpx.post(
-                HASURA_GRAPHQL_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-hasura-admin-secret": HASURA_ADMIN_SECRET
-                },
-                json={
-                    "query": create_mutation,
-                    "variables": {
-                        "files_id": file_id,
-                        "information_id": information_id,
-                        "value": status_value
-                    }
-                },
-                timeout=10.0
-            )
-            create_response.raise_for_status()
-            create_data = create_response.json()
-
-            if "errors" in create_data:
-                logger.error(f"Failed to create tiling-status record: {create_data['errors']}")
-                return
-
-            logger.info(f"✅ Created and set tiling status for file_id={file_id}: '{status_value}'")
+            logger.warning(f"No tiling-status record found for file_id={file_id}")
             return
 
         record_id = records[0]["id"]
@@ -241,6 +163,17 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
     except Exception as e:
         logger.error(f"❌ Hasura update failed for file_id={file_id}: {str(e)}")
 
+
+# Job status tracking
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# In-memory job store (for simple implementation)
+jobs_store = {}
+jobs_lock = threading.Lock()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -680,6 +613,25 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/api/status/{job_id}")
+async def get_job_status(job_id: str, api_key_valid: bool = Depends(verify_api_key)):
+    """Get the status of a processing job"""
+    with jobs_lock:
+        if job_id not in jobs_store:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        job = jobs_store[job_id]
+        return {
+            "job_id": job_id,
+            "status": job["status"],
+            "progress": job.get("progress", 0),
+            "message": job.get("message", ""),
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+            "result": job.get("result")
+        }
+
+
 @app.delete("/api/delete-floorplan/{file_id}")
 async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_api_key)):
     """
@@ -865,63 +817,91 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
 
 
 def update_job_progress(job_id: str, progress: int, message: str):
-    """Log job progress. In-memory tracking removed; status is reported via Hasura."""
-    logger.info(f"Job {job_id} [{progress}%]: {message}")
+    """Helper to update job progress"""
+    with jobs_lock:
+        if job_id in jobs_store:
+            jobs_store[job_id]["progress"] = progress
+            jobs_store[job_id]["message"] = message
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+
+
+def process_floorplan_background(job_id: str, file_url: str, file_id: int, environment: str = "test"):
+    """Background task to process the floorplan"""
+    try:
+        # Update status to processing
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.PROCESSING
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+
+        # 1️⃣ START: Update Hasura status
+        update_tiling_status(file_id, "Tiling running")
+
+        # Call the synchronous processing logic
+        result = process_floorplan_sync(file_url, job_id, file_id, environment)
+
+        # Mark as completed
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.COMPLETED
+            jobs_store[job_id]["progress"] = 100
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+            jobs_store[job_id]["message"] = "Processing completed successfully"
+            jobs_store[job_id]["result"] = result
+
+        # 2️⃣ SUCCESS: Update Hasura status
+        update_tiling_status(file_id, "Tiling finished")
+
+    except Exception as e:
+        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.FAILED
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+            jobs_store[job_id]["message"] = str(e)
+
+        # 3️⃣ ERROR: Update Hasura status
+        update_tiling_status(file_id, "Error", error_message=str(e))
 
 
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
+async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Submit a PDF floorplan for tiling.
+    Submit a PDF floorplan for processing (async - returns immediately).
 
-    Immediately enqueues a job on the 'tileservice' Azure Storage Queue and returns
-    HTTP 202. The separate worker (worker.py) pulls jobs one at a time, so parallel
-    API calls never compete for memory.
+    Args:
+        request: ProcessFloorplanRequest with file_url
+
+    Returns:
+        JSON response with job_id for tracking progress
     """
+    # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
 
-    if not QUEUE_STORAGE_CONNECTION_STRING:
-        raise HTTPException(
-            status_code=500,
-            detail="Queue storage connection string not configured (AZURE_STORAGE_CONNECTION_STRING)"
-        )
-
+    # Generate job ID
     job_id = str(uuid.uuid4())
-    message = json.dumps({
-        "job_id": job_id,
-        "file_url": request.file_url,
-        "file_id": request.file_id,
-        "environment": request.environment,
-        "enqueued_at": datetime.utcnow().isoformat()
-    })
 
-    try:
-        queue_service = QueueServiceClient.from_connection_string(QUEUE_STORAGE_CONNECTION_STRING)
-        queue_client = queue_service.get_queue_client("tileservice")
-        queue_client.send_message(message)
-        logger.info(
-            f"✅ Job {job_id} enqueued on 'tileservice' | "
-            f"file_id={request.file_id} | env={request.environment}"
-        )
-    except Exception as q_err:
-        logger.error(f"Failed to enqueue job: {q_err}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to enqueue tiling job: {str(q_err)}"
-        )
-
-    return JSONResponse(
-        status_code=202,
-        content={
-            "success": True,
-            "message": "Tiling job queued — processing will start shortly",
+    # Create job record
+    now = datetime.utcnow().isoformat()
+    with jobs_lock:
+        jobs_store[job_id] = {
             "job_id": job_id,
-            "queue": "tileservice",
-            "file_id": request.file_id,
-            "environment": request.environment
+            "file_url": request.file_url,
+            "status": JobStatus.QUEUED,
+            "progress": 0,
+            "message": "Job queued for processing",
+            "created_at": now,
+            "updated_at": now,
+            "result": None
         }
-    )
+
+    # Start background processing
+    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id, request.environment)
+
+    return {
+        "job_id": job_id,
+        "status": JobStatus.QUEUED,
+        "message": "Job queued for processing",
+        "status_url": f"/api/status/{job_id}"
+    }
 
 
 def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment: str = "test"):
