@@ -33,12 +33,15 @@ jobs:
 
       - name: Build and deploy to Azure Container Apps
         run: |
-          # Ensure Container App has system-assigned managed identity
-          az containerapp identity assign \
-            --name blockstilingservice \
-            --resource-group KompassExperimental \
-            --system-assigned || true
-          
+          # Connection strings reused across multiple steps
+          STORAGE_CONN="DefaultEndpointsProtocol=https;AccountName=blocksplayground;AccountKey=kkEgPRG9ve1s/1mv/xNXdMwpd4Yp7tQVnweFnQvbWCK45khrlyJJnhLVKKZXB8BS/fzhRIPkYtEO+AStKbWzrw==;EndpointSuffix=core.windows.net"
+          PROD_STORAGE_CONN="DefaultEndpointsProtocol=https;AccountName=productionstorageblocks;AccountKey=d0WDrWnXsj+g9K8onIBIMSB/kYIiC0sraJVxkDJiZdRuN60CE6ojMojUD8VIdEUOaA/4kDz3G3ge+AStM5ceEw==;EndpointSuffix=core.windows.net"
+
+          # Ensure tiling queue exists on production storage account (idempotent)
+          az storage queue create \
+            --name tiling-jobs \
+            --connection-string "${PROD_STORAGE_CONN}" || true
+
           # Build container image in ACR
           IMAGE_TAG=$(date +%Y%m%d%H%M%S)
           az acr build \
@@ -47,16 +50,51 @@ jobs:
             --image blockstilingservice:latest \
             --file Dockerfile \
             .
-          
-          # Update Container App with new image and environment variables
+
+          # Update API Container App (lightweight - just enqueues requests)
           az containerapp update \
             --name blockstilingservice \
             --resource-group KompassExperimental \
             --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG} \
             --set-env-vars \
-              AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=blocksplayground;AccountKey=kkEgPRG9ve1s/1mv/xNXdMwpd4Yp7tQVnweFnQvbWCK45khrlyJJnhLVKKZXB8BS/fzhRIPkYtEO+AStKbWzrw==;EndpointSuffix=core.windows.net" \
+              AZURE_STORAGE_CONNECTION_STRING="${STORAGE_CONN}" \
               TEST_STORAGE_ACCOUNT_NAME="blocksplayground" \
-              PRODUCTION_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=productionstorageblocks;AccountKey=d0WDrWnXsj+g9K8onIBIMSB/kYIiC0sraJVxkDJiZdRuN60CE6ojMojUD8VIdEUOaA/4kDz3G3ge+AStM5ceEw==;EndpointSuffix=core.windows.net" \
+              PRODUCTION_STORAGE_CONNECTION_STRING="${PROD_STORAGE_CONN}" \
               PRODUCTION_STORAGE_ACCOUNT_NAME="productionstorageblocks" \
               HASURA_GRAPHQL_URL="https://hasura-blocks-prod.blackpond-228bbd7d.germanywestcentral.azurecontainerapps.io/v1/graphql" \
-              HASURA_ADMIN_SECRET="admin"
+              HASURA_ADMIN_SECRET="admin" \
+              TILING_QUEUE_NAME="tiling-jobs"
+
+          # Get Container Apps environment name
+          CA_ENV=$(az containerapp env list \
+            --resource-group KompassExperimental \
+            --query "[0].name" -o tsv)
+
+          # Create worker Container App if it doesn't exist yet (sets up KEDA queue scaler)
+          az containerapp create \
+            --name blockstilingservice-worker \
+            --resource-group KompassExperimental \
+            --environment "${CA_ENV}" \
+            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG} \
+            --cpu 2 --memory 4Gi \
+            --command "python" "worker.py" \
+            --min-replicas 0 --max-replicas 1 \
+            --secrets "storage-connection-string=${STORAGE_CONN}" \
+            --env-vars \
+              "AZURE_STORAGE_CONNECTION_STRING=secretref:storage-connection-string" \
+              "PRODUCTION_STORAGE_CONNECTION_STRING=${PROD_STORAGE_CONN}" \
+              "PRODUCTION_STORAGE_ACCOUNT_NAME=productionstorageblocks" \
+              "TEST_STORAGE_ACCOUNT_NAME=blocksplayground" \
+              "HASURA_GRAPHQL_URL=https://hasura-blocks-prod.blackpond-228bbd7d.germanywestcentral.azurecontainerapps.io/v1/graphql" \
+              "HASURA_ADMIN_SECRET=admin" \
+              "TILING_QUEUE_NAME=tiling-jobs" \
+              "PYTHONUNBUFFERED=1" \
+            --scale-rule-name queue-rule \
+            --scale-rule-type azure-queue \
+            --scale-rule-metadata "queueName=tiling-jobs" "queueLength=1" \
+            --scale-rule-auth "connection=storage-connection-string" 2>/dev/null || \
+          # Update existing worker Container App with new image
+          az containerapp update \
+            --name blockstilingservice-worker \
+            --resource-group KompassExperimental \
+            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG}

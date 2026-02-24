@@ -16,7 +16,8 @@ import fitz  # PyMuPDF
 import httpx
 import uvicorn
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request)
+from azure.storage.queue import QueueServiceClient
+from fastapi import (Depends, FastAPI, Header, HTTPException, Request)
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageChops
 from pydantic import BaseModel
@@ -44,6 +45,9 @@ TEST_STORAGE_ACCOUNT_NAME = os.environ.get("TEST_STORAGE_ACCOUNT_NAME", "blocksp
 
 PRODUCTION_STORAGE_CONNECTION_STRING = os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")  # Production storage
 PRODUCTION_STORAGE_ACCOUNT_NAME = os.environ.get("PRODUCTION_STORAGE_ACCOUNT_NAME")  # Production account name
+
+# Queue configuration (for decoupling HTTP requests from tiling work)
+TILING_QUEUE_NAME = os.environ.get("TILING_QUEUE_NAME", "tiling-jobs")
 
 def verify_api_key(x_api_key: str = Header(None)):
     """Verify the API key from request header"""
@@ -235,17 +239,49 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         logger.error(f"❌ Hasura update failed for file_id={file_id}: {str(e)}")
 
 
-# Job status tracking (kept for backwards compatibility, not used in-memory)
+# Job status tracking (kept for backwards compatibility)
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
 
-# True while a tiling job is running on this container instance.
-# The /health readiness probe returns 503 when this is True, which tells
-# Azure CA's load balancer to stop routing ALL new requests here.
-_is_tiling = False
+
+def enqueue_tiling_job(file_url: str, file_id: int, environment: str, job_id: str) -> None:
+    """
+    Push a tiling request onto Azure Storage Queue.
+    The worker Container App (scaled by KEDA) picks it up and processes it.
+    Returns immediately - status is tracked via Hasura tiling-status.
+    """
+    if not PRODUCTION_STORAGE_CONNECTION_STRING:
+        raise HTTPException(
+            status_code=500,
+            detail="Storage connection string not configured (PRODUCTION_STORAGE_CONNECTION_STRING)"
+        )
+
+    try:
+        queue_service = QueueServiceClient.from_connection_string(PRODUCTION_STORAGE_CONNECTION_STRING)
+
+        # Ensure queue exists (idempotent - no-op if already created)
+        try:
+            queue_service.create_queue(TILING_QUEUE_NAME)
+            logger.info(f"📬 Created queue '{TILING_QUEUE_NAME}'")
+        except Exception:
+            pass  # Queue already exists
+
+        queue_client = queue_service.get_queue_client(TILING_QUEUE_NAME)
+        message = json.dumps({
+            "file_url": file_url,
+            "file_id": file_id,
+            "environment": environment,
+            "job_id": job_id,
+        })
+        queue_client.send_message(message)
+        logger.info(f"✅ Enqueued tiling job | file_id={file_id} | job_id={job_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to enqueue tiling job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue tiling job: {str(e)}")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -681,11 +717,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Readiness probe - returns 503 while tiling is active.
-    Azure CA stops routing new requests to this container when 503 is returned.
-    """
-    if _is_tiling:
-        return JSONResponse(status_code=503, content={"status": "busy", "reason": "tiling in progress"})
+    """Health probe - API container is always ready (tiling runs in isolated job containers)"""
     return {"status": "healthy"}
 
 
@@ -888,96 +920,35 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
 
 
 def update_job_progress(job_id: str, progress: int, message: str):
-    """Helper to update job progress (logs only, no in-memory store)"""
+    """Helper to update job progress (logs only)"""
     logger.info(f"Job {job_id} progress: {progress}% - {message}")
 
 
-def process_floorplan_background(file_url: str, job_id: str, file_id: int, environment: str):
-    """Background task to process the floorplan.
-    _is_tiling is already True (set by the endpoint) - reset to False when done.
-    """
-    try:
-        # 1️⃣ START: Update Hasura status
-        update_tiling_status(file_id, "Tiling running")
-
-        # Process the floorplan
-        result = process_floorplan_sync(file_url, job_id, file_id, environment)
-        
-        # 2️⃣ SUCCESS: Update Hasura status
-        update_tiling_status(file_id, "Tiling finished")
-        
-        logger.info(f"✅ Job {job_id} completed successfully for file_id={file_id}")
-
-    except Exception as e:
-        logger.error(f"❌ Job {job_id} failed: {str(e)}", exc_info=True)
-        
-        # 3️⃣ ERROR: Update Hasura status
-        update_tiling_status(file_id, "Error", error_message=str(e))
-
-    finally:
-        _is_tiling = False
-        logger.info(f"🔓 Container released (file_id={file_id}) - readiness probe now returns 200")
-
-
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks, api_key_valid: bool = Depends(verify_api_key)):
+async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Trigger floorplan tiling - returns immediately, processing continues in background.
-    
-    With concurrency=1, each request gets its own isolated container.
-    The background task runs in that dedicated container with full resources.
-    
-    Status updates are sent to Hasura tiling-status field.
-
-    Args:
-        request: ProcessFloorplanRequest with file_url, file_id, environment
-
-    Returns:
-        JSON response confirming the job was queued
+    Queue a floorplan tiling request onto Azure Storage Queue.
+    The worker Container App (KEDA-scaled) picks it up and processes it.
+    Returns immediately - track progress via Hasura tiling-status.
     """
-    # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
 
-    # If this container is already tiling, the readiness probe is already returning 503
-    # so Azure CA shouldn't route here — but reject just in case of a race condition.
-    if _is_tiling:
-        logger.warning(f"⚠️ Container busy, rejecting request for file_id={request.file_id}")
-        return JSONResponse(
-            status_code=503,
-            headers={"Retry-After": "10"},
-            content={
-                "success": False,
-                "error": "container_busy",
-                "message": "Container is busy tiling. Azure CA will retry on a fresh container."
-            }
-        )
-
-    # Generate job ID for logging
     job_id = str(uuid.uuid4())
-    logger.info(f"🚀 Queuing floorplan job {job_id} for file_id={request.file_id}")
+    logger.info(f"📥 Queuing tiling job | file_id={request.file_id} | job_id={job_id}")
 
-    # Mark container as busy BEFORE queuing the task.
-    # This means /health returns 503 immediately - no race condition window.
-    global _is_tiling
-    _is_tiling = True
-    logger.info(f"🔒 Container marked busy - readiness probe now returns 503")
-
-    # Queue background processing in this container
-    background_tasks.add_task(
-        process_floorplan_background,
+    enqueue_tiling_job(
         request.file_url,
-        job_id,
         request.file_id,
-        request.environment
+        request.environment,
+        job_id
     )
 
-    # Return immediately - processing continues in background
     return {
         "success": True,
         "job_id": job_id,
         "file_id": request.file_id,
-        "message": "Tiling job queued. Check Hasura tiling-status for progress."
+        "message": "Tiling job queued. Worker will pick it up shortly. Check Hasura tiling-status for progress."
     }
 
 

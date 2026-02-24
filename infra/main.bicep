@@ -31,6 +31,10 @@ param hasuraGraphqlUrl string = 'https://hasura-blocks-prod.blackpond-228bbd7d.g
 @secure()
 param hasuraAdminSecret string
 
+@description('Production storage connection string (queue + production blobs)')
+@secure()
+param productionStorageConnectionString string = ''
+
 @description('API key for securing the tiling service endpoints')
 @secure()
 param apiKey string = ''
@@ -43,7 +47,7 @@ param minReplicas int = 0
 @description('Maximum number of replicas')
 @minValue(1)
 @maxValue(1000)
-param maxReplicas int = 50
+param maxReplicas int = 3
 
 @description('CPU cores per container instance')
 @allowed([
@@ -170,6 +174,10 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               name: 'PYTHONUNBUFFERED'
               value: '1'
             }
+            {
+              name: 'TILING_QUEUE_NAME'
+              value: 'tiling-jobs'
+            }
           ]
           probes: [
             {
@@ -223,3 +231,100 @@ output containerAppFqdn string = containerApp.properties.configuration.ingress.f
 output containerAppName string = containerApp.name
 output containerAppEnvName string = containerAppEnv.name
 output logAnalyticsWorkspaceId string = logAnalytics.id
+output workerAppName string = workerApp.name
+
+// Worker Container App - processes tiling queue messages one at a time
+// KEDA azure-queue scaler: 0 replicas when queue empty, 1 replica when messages arrive
+resource workerApp 'Microsoft.App/containerApps@2023-05-01' = {
+  name: '${appName}-worker-${environmentName}'
+  location: location
+  properties: {
+    managedEnvironmentId: containerAppEnv.id
+    configuration: {
+      // No ingress - worker reads from queue, never receives HTTP traffic
+      secrets: [
+        {
+          name: 'storage-connection-string'
+          value: storageConnectionString
+        }
+        {
+          name: 'production-storage-connection-string'
+          value: productionStorageConnectionString
+        }
+        {
+          name: 'hasura-admin-secret'
+          value: hasuraAdminSecret
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'tiling-worker'
+          image: containerImage
+          command: [ 'python', 'worker.py' ]
+          resources: {
+            cpu: json(cpuCores)
+            memory: '${memorySize}Gi'
+          }
+          env: [
+            {
+              name: 'AZURE_STORAGE_CONNECTION_STRING'
+              secretRef: 'storage-connection-string'
+            }
+            {
+              name: 'HASURA_GRAPHQL_URL'
+              value: hasuraGraphqlUrl
+            }
+            {
+              name: 'HASURA_ADMIN_SECRET'
+              secretRef: 'hasura-admin-secret'
+            }
+            {
+              name: 'PRODUCTION_STORAGE_CONNECTION_STRING'
+              secretRef: 'production-storage-connection-string'
+            }
+            {
+              name: 'PRODUCTION_STORAGE_ACCOUNT_NAME'
+              value: ''
+            }
+            {
+              name: 'TEST_STORAGE_ACCOUNT_NAME'
+              value: 'blocksplayground'
+            }
+            {
+              name: 'TILING_QUEUE_NAME'
+              value: 'tiling-jobs'
+            }
+            {
+              name: 'PYTHONUNBUFFERED'
+              value: '1'
+            }
+          ]
+        }
+      ]
+      scale: {
+        minReplicas: 0    // Scale to zero when queue is empty
+        maxReplicas: 1    // One worker at a time - sequential, predictable memory usage
+        rules: [
+          {
+            name: 'queue-rule'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                queueName: 'tiling-jobs'
+                queueLength: '1'    // Activate as soon as 1 message is present
+              }
+              auth: [
+                {
+                  secretRef: 'production-storage-connection-string'
+                  triggerParameter: 'connection'
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

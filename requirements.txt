@@ -16,6 +16,9 @@ pillow==10.2.0
 # Azure Storage
 azure-storage-blob==12.19.0
 
+# Azure Storage Queue (for decoupling requests from tiling work - KEDA queue scaler)
+azure-storage-queue==12.9.0
+
 # Optional: Async support for better performance
 httpx==0.26.0
 
