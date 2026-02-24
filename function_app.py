@@ -3,12 +3,14 @@ import json
 import logging
 import math
 import os
+import uuid
 from datetime import datetime
 from typing import Dict, List, Tuple
 
 import azure.functions as func
 import pypdfium2 as pdfium
 from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.queue import QueueServiceClient
 from PIL import Image, ImageChops
 
 app = func.FunctionApp()
@@ -438,350 +440,296 @@ def extract_floorplan_id(blob_name: str) -> str:
     return filename.rsplit('.', 1)[0]
 
 @app.route(route="process-floorplan", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def blocks_floorplan_tiler_service(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("HTTP POST request received for floorplan processing")
+def blocks_floorplan_tiler_http(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Lightweight HTTP entry point.
+    Validates the request, puts a message on the 'tileservice' Azure Storage Queue,
+    and returns 202 Accepted immediately.  The actual CPU-heavy tiling work is done
+    by blocks_floorplan_tiler_queue below, one job at a time.
+    """
+    logging.info("HTTP POST /process-floorplan — enqueueing tiling job")
 
-    # Wrap everything in a try-catch to ensure we always return a proper HTTP response
+    # ── Parse request ─────────────────────────────────────────────────────────
     try:
-        # Parse request body
-        try:
-            req_body = req.get_json()
-        except ValueError as e:
-            logging.error(f"Invalid JSON in request: {str(e)}")
-            return func.HttpResponse(
-                json.dumps({"success": False, "error": "Invalid JSON in request body"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-
-        file_url = req_body.get('file_url')
-        floorplan_name = req_body.get('floorplan_name')  # Optional custom name
-
-        if not file_url:
-            return func.HttpResponse(
-                json.dumps({"success": False, "error": "Missing 'file_url' in request body"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-
-        logging.info(f"Processing PDF from URL: {file_url}")
-
-        # Download the PDF from Azure Blob Storage or URL
-        try:
-            # Check if it's an Azure Blob Storage URL
-            if 'blob.core.windows.net' in file_url:
-                # Use Azure SDK to download from blob storage
-                connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-                if not connection_string:
-                    return func.HttpResponse(
-                        json.dumps({"success": False, "error": "Azure Storage connection string not configured"}),
-                        status_code=500,
-                        mimetype="application/json"
-                    )
-
-                # Parse the blob URL to extract container and blob name
-                from urllib.parse import urlparse
-                parsed_url = urlparse(file_url)
-                # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
-                path_parts = parsed_url.path.lstrip('/').split('/', 1)
-                container_name = path_parts[0]
-                blob_name = path_parts[1] if len(path_parts) > 1 else ''
-
-                logging.info(f"Downloading from Azure Blob: container={container_name}, blob={blob_name}")
-
-                blob_service = BlobServiceClient.from_connection_string(connection_string)
-                blob_client = blob_service.get_blob_client(container_name, blob_name)
-                file_content = blob_client.download_blob().readall()
-                logging.info(f"Downloaded PDF from blob storage: {len(file_content)} bytes")
-            else:
-                # Download from external URL
-                import urllib.request
-                with urllib.request.urlopen(file_url) as response:
-                    file_content = response.read()
-                logging.info(f"Downloaded PDF from URL: {len(file_content)} bytes")
-        except Exception as download_error:
-            logging.error(f"Error downloading file: {str(download_error)}", exc_info=True)
-            return func.HttpResponse(
-                json.dumps({"success": False, "error": f"Failed to download file: {str(download_error)}"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-
-        # Extract filename from URL or use provided name
-        if not floorplan_name:
-            from urllib.parse import urlparse
-            parsed_url = urlparse(file_url)
-            floorplan_name = parsed_url.path.split('/')[-1]
-            if not floorplan_name.lower().endswith('.pdf'):
-                floorplan_name = 'floorplan.pdf'
-
-        # Create a mock blob name for compatibility
-        myblob_name = f"floor-plans/{floorplan_name}"
-
-        # ============================================================
-        # 🚀 PRODUCTION MODE - HIGH QUALITY TILING SETTINGS
-        # ============================================================
-
-        # 🎨 QUALITY SETTINGS (Balanced for performance):
-        PDF_SCALE = 15.0         # 1080 DPI - Good quality, won't crash
-        MAX_DIMENSION = 30000    # 30K pixels max dimension
-
-        # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
-        MAX_ZOOM_LIMIT = 15      # Maximum zoom levels allowed
-        FORCED_MAX_Z_ENV = 10    # Allow zoom up to level 10 (will upscale beyond native)
-        TILE_SIZE_ENV = 512      # 512px tiles for optimal balance
-        MIN_ZOOM_ENV = 0         # Start from zoom level 0
-
-        # ✅ Deep zoom with upscaling beyond native resolution
-        # Native res at zoom ~6-7, then upscales for zoom 8-10
-        # ============================================================
-
-        # Check if the file is a PDF
-        if not floorplan_name.lower().endswith('.pdf'):
-            return func.HttpResponse(
-                json.dumps({"success": False, "error": "File must be a PDF"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-
-        # Guard: Only process PDFs uploaded at the container root to avoid re-processing
-        # when we copy the PDF into a subfolder after processing.
-        try:
-            container_and_rest = myblob_name.split('/', 1)  # ['floor-plans', 'foo.pdf'] or ['floor-plans', 'id/foo.pdf']
-            relative_path = container_and_rest[1] if len(container_and_rest) > 1 else myblob_name
-            if '/' in relative_path:
-                logging.info(f"Ignoring nested PDF '{relative_path}' to prevent re-processing loop.")
-                return func.HttpResponse(
-                    json.dumps({"success": True, "message": "Skipped nested PDF to prevent re-processing"}),
-                    status_code=200,
-                    mimetype="application/json"
-                )
-        except Exception as _:
-            # If parsing fails for any reason, continue (best-effort guard)
-            pass
-
-        logging.info(f"Processing PDF file: {myblob_name}")
-        # Validate TILE_SIZE to supported values
-        if TILE_SIZE_ENV not in (128, 256, 512, 1024):
-            logging.warning(f"Unsupported TILE_SIZE={TILE_SIZE_ENV}; defaulting to 256")
-            TILE_SIZE_ENV = 256
-
-        logging.info(
-            "Configuration overrides → "
-            f"PDF_SCALE={PDF_SCALE}, MAX_DIMENSION={MAX_DIMENSION}, "
-            f"MAX_ZOOM_LIMIT={MAX_ZOOM_LIMIT}, FORCED_MAX_Z={FORCED_MAX_Z_ENV}, "
-            f"TILE_SIZE={TILE_SIZE_ENV}, MIN_ZOOM={MIN_ZOOM_ENV}"
-        )
-
-        # File content already downloaded in HTTP trigger
-        logging.info(f"Processing {len(file_content)} bytes from PDF file")
-
-        # 1. Convert PDF to PNG (single page expected)
-        # Higher scale = better quality at max zoom
-        images = pdf_to_images(file_content, scale=PDF_SCALE, max_dimension=MAX_DIMENSION)
-
-        if len(images) == 0:
-            logging.error("No images generated from PDF")
-            return func.HttpResponse(
-                json.dumps({"error": "No images generated from PDF"}),
-                status_code=500,
-                mimetype="application/json"
-            )
-
-        # Use first page (floor plans should be single page)
-        floor_plan_image = images[0]
-        logging.info(f"Floor plan dimensions (pre-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels")
-
-        # Release extra images from memory immediately
-        if len(images) > 1:
-            for img in images[1:]:
-                img.close()
-            images = [floor_plan_image]
-
-        # Optional: auto-trim white margins around the plan to reduce empty space/tiles
-        floor_plan_image = trim_whitespace(floor_plan_image, bg_color=(255, 255, 255), tolerance=10, padding=20)
-        logging.info(f"Floor plan dimensions (post-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels")
-
-        # 2. Set zoom levels for Leaflet tiles
-        # Always produce up to a fixed max zoom for Leaflet folder structure (z/x/y),
-        # independent of the native resolution. This adds more zoom steps but does not
-        # add new detail beyond the image's native pixels.
-        FORCED_MAX_Z = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
-        max_zoom = FORCED_MAX_Z
-        min_zoom = max(0, min(MIN_ZOOM_ENV, max_zoom))
-        total_levels = (max_zoom - min_zoom + 1)
-        logging.info(f"Using Leaflet zoom levels: {min_zoom}-{max_zoom} (total {total_levels})")
-
-        # Log native tile density at highest zoom for visibility
-        tile_size = TILE_SIZE_ENV
-        native_tiles_x = math.ceil(floor_plan_image.width / tile_size)
-        native_tiles_y = math.ceil(floor_plan_image.height / tile_size)
-        native_total_tiles = native_tiles_x * native_tiles_y
-        logging.info(
-            "Max-zoom native tile grid: "
-            f"{native_tiles_x}x{native_tiles_y} (total {native_total_tiles}) at {floor_plan_image.width}x{floor_plan_image.height}px"
-        )
-
-        # 3. Generate tile pyramid using Simple CRS (like MapTiler) with optimized quality
-        logging.info("🗺️ Generating Simple CRS tile pyramid with ultra-high quality...")
-
-        # Create zoom level list from min to max
-        zoom_levels = list(range(min_zoom, max_zoom + 1))
-
-        # Initialize the Simple CRS floorplan tiler with optimized settings
-        floorplan_tiler = SimpleFloorplanTiler(tile_size=tile_size)
-
-        # Generate tiles using Simple CRS (pixel-based, no geographic projection)
-        pyramid = floorplan_tiler.tile_image(floor_plan_image, zoom_levels)
-        total_tiles = sum(len(tiles) for tiles in pyramid.values())
-        logging.info(f"Generated {total_tiles} high-quality tiles across {len(pyramid)} zoom levels")
-
-        # 4. Generate preview image with optimal compression
-        logging.info("Generating preview image...")
-        preview = generate_preview(floor_plan_image, max_width=800)
-
-        # Save optimized base image for reference
-        base_image_buffer = io.BytesIO()
-        try:
-            floor_plan_image.save(base_image_buffer, format='WebP', quality=85, method=4)
-            base_image_format = 'webp'
-            logging.info("✅ Using WebP format for base image compression")
-        except Exception:
-            base_image_buffer = io.BytesIO()
-            floor_plan_image.save(base_image_buffer, format='PNG', compress_level=6, optimize=True)
-            base_image_format = 'png'
-            logging.info("✅ Using PNG format for base image compression")
-
-        base_image_data = base_image_buffer.getvalue()
-        base_image_size_mb = len(base_image_data) / (1024*1024)
-        logging.info(f"📦 Base image compressed to: {base_image_size_mb:.2f} MB")
-
-        # 5. Create metadata with high-quality settings
-        floorplan_id = extract_floorplan_id(myblob_name)
-        metadata = create_metadata(
-            floor_plan_image,
-            max_zoom,
-            floorplan_id,
-            tile_size=tile_size,
-            min_zoom=min_zoom,
-            zoom_levels=zoom_levels
-        )
-        metadata["total_tiles"] = total_tiles
-        metadata["quality_settings"] = {
-            "pdf_scale": PDF_SCALE,
-            "max_dimension": MAX_DIMENSION,
-            "dpi": PDF_SCALE * 72,
-            "base_image_format": base_image_format,
-            "base_image_size_mb": round(base_image_size_mb, 2)
-        }
-        logging.info(f"Created Web Mercator metadata for ultra-high quality floor plan: {floorplan_id}")
-
-        # 6. Upload to blob storage
-        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        if not connection_string:
-            logging.error("Azure Storage connection string not found in environment")
-            return func.HttpResponse(
-                json.dumps({"error": "Azure Storage connection string not configured"}),
-                status_code=500,
-                mimetype="application/json"
-            )
-
-        logging.info("Uploading high-quality tiles and assets to blob storage...")
-        upload_tiles_to_blob(
-            pyramid=pyramid,
-            preview=preview,
-            metadata=metadata,
-            floorplan_id=floorplan_id,
-            original_blob_name=myblob_name,
-            connection_string=connection_string,
-            container="floor-plans",
-            base_image=floor_plan_image,
-            base_image_data=base_image_data,
-            base_image_format=base_image_format
-        )
-
-        # Release memory: close images and clear pyramid after upload
-        preview.close()
-        for zoom_tiles in pyramid.values():
-            for _, _, tile_img in zoom_tiles:
-                tile_img.close()
-        pyramid.clear()
-        logging.info("✅ Cleaned up image memory after upload")
-
-        # 7. Archive the original PDF and clean up
-        blob_service = BlobServiceClient.from_connection_string(connection_string)
-        source_container = "floor-plans"
-
-        # Store a copy of the original PDF under {floorplan_id}/{floorplan_id}.pdf
-        try:
-            dest_blob_name = f"{floorplan_id}/{floorplan_id}.pdf"
-            dest_client = blob_service.get_blob_client(source_container, dest_blob_name)
-            content_settings = ContentSettings(content_type="application/pdf")
-            dest_client.upload_blob(file_content, overwrite=True, content_settings=content_settings)
-            logging.info(f"Archived original PDF at: {dest_blob_name}")
-        except Exception as copy_err:
-            logging.warning(f"Could not store archived PDF copy: {str(copy_err)}")
-
-        # Delete the original root-level PDF (only if it was uploaded at root)
-        try:
-            src_relative = relative_path
-            if '/' not in src_relative:
-                src_client = blob_service.get_blob_client(source_container, src_relative)
-                src_client.delete_blob()
-                logging.info(f"Deleted original root PDF: {src_relative}")
-        except Exception as del_err:
-            logging.warning(f"Could not delete original PDF: {str(del_err)}")
-
-        logging.info(f"🚀 Successfully created ULTRA-HIGH QUALITY tiled floor plan: {floorplan_id}")
-        logging.info(f"   📐 Dimensions: {floor_plan_image.width}x{floor_plan_image.height}px")
-        logging.info(f"   🎨 Quality: {PDF_SCALE * 72:.0f} DPI (PDF_SCALE={PDF_SCALE})")
-        logging.info(f"   📦 Base image: {base_image_size_mb:.2f} MB ({base_image_format.upper()})")
-        logging.info(f"   🗺️ Zoom levels: {total_levels} ({min_zoom}-{max_zoom})")
-        logging.info(f"   🏗️ Total tiles: {total_tiles}")
-        logging.info(f"   📏 Tile size: {tile_size}px")
-        logging.info(f"   🌐 Coordinate system: Simple CRS (L.CRS.Simple)")
-        logging.info(f"   💾 Storage: floor-plans/{floorplan_id}/")
-
-        # Return success response
+        req_body = req.get_json()
+    except ValueError as e:
         return func.HttpResponse(
-            json.dumps({
-                "success": True,
-                "floorplan_id": floorplan_id,
-                "dimensions": {
-                    "width": floor_plan_image.width,
-                    "height": floor_plan_image.height
-                },
-                "quality": {
-                    "dpi": int(PDF_SCALE * 72),
-                    "base_image_size_mb": round(base_image_size_mb, 2),
-                    "format": base_image_format.upper()
-                },
-                "tiles": {
-                    "total": total_tiles,
-                    "zoom_levels": total_levels,
-                    "min_zoom": min_zoom,
-                    "max_zoom": max_zoom,
-                    "tile_size": tile_size
-                },
-                "urls": {
-                    "metadata": f"https://blocksplayground.blob.core.windows.net/floor-plans/{floorplan_id}/metadata.json",
-                    "preview": f"https://blocksplayground.blob.core.windows.net/floor-plans/{floorplan_id}/preview.png",
-                    "tiles": f"https://blocksplayground.blob.core.windows.net/floor-plans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
-                }
-            }),
-            status_code=200,
+            json.dumps({"success": False, "error": "Invalid JSON in request body"}),
+            status_code=400,
             mimetype="application/json"
         )
 
-    except Exception as outer_error:
-        # Final catch-all for any unexpected errors
-        logging.error(f"❌ Unexpected error: {str(outer_error)}", exc_info=True)
+    file_url = req_body.get("file_url")
+    floorplan_name = req_body.get("floorplan_name")
+
+    if not file_url:
         return func.HttpResponse(
-            json.dumps({
-                "success": False,
-                "error": f"Unexpected error: {str(outer_error)}",
-                "error_type": type(outer_error).__name__
-            }),
+            json.dumps({"success": False, "error": "Missing 'file_url' in request body"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+
+    # ── Build queue message ───────────────────────────────────────────────────
+    job_id = str(uuid.uuid4())
+    message = json.dumps({
+        "job_id": job_id,
+        "file_url": file_url,
+        "floorplan_name": floorplan_name,
+        "enqueued_at": datetime.utcnow().isoformat()
+    })
+
+    # ── Enqueue ───────────────────────────────────────────────────────────────
+    connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if not connection_string:
+        return func.HttpResponse(
+            json.dumps({"success": False, "error": "Azure Storage connection string not configured"}),
             status_code=500,
             mimetype="application/json"
         )
+
+    try:
+        queue_service = QueueServiceClient.from_connection_string(connection_string)
+        queue_client = queue_service.get_queue_client("tileservice")
+        queue_client.send_message(message)
+        logging.info(f"✅ Job {job_id} enqueued on 'tileservice' for: {file_url}")
+    except Exception as q_err:
+        logging.error(f"Failed to enqueue job: {q_err}", exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"success": False, "error": f"Failed to enqueue job: {str(q_err)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+    return func.HttpResponse(
+        json.dumps({
+            "success": True,
+            "message": "Tiling job queued — processing will start shortly",
+            "job_id": job_id,
+            "queue": "tileservice"
+        }),
+        status_code=202,
+        mimetype="application/json"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Queue trigger — processes ONE tiling job at a time.
+# host.json sets batchSize=1 / maxConcurrentCalls=1 so this is truly serial.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.queue_trigger(
+    arg_name="msg",
+    queue_name="tileservice",
+    connection="AZURE_STORAGE_CONNECTION_STRING"
+)
+def blocks_floorplan_tiler_queue(msg: func.QueueMessage) -> None:
+    """
+    Queue-triggered tiling processor.
+    Reads one job at a time from the 'tileservice' queue and performs the full
+    PDF → tile pyramid → blob upload pipeline.
+    If the function raises, Azure Functions will retry up to maxDequeueCount
+    times (default 5) then move the message to 'tileservice-poison'.
+    """
+    # ── Decode message ────────────────────────────────────────────────────────
+    try:
+        body = json.loads(msg.get_body().decode("utf-8"))
+    except Exception as parse_err:
+        logging.error(f"Could not parse queue message: {parse_err}")
+        return  # Poison — don't retry malformed messages
+
+    job_id = body.get("job_id", "unknown")
+    file_url = body.get("file_url")
+    floorplan_name = body.get("floorplan_name")
+    enqueued_at = body.get("enqueued_at", "")
+
+    logging.info(f"▶ Queue job {job_id} — file_url={file_url}  enqueued_at={enqueued_at}")
+
+    if not file_url:
+        logging.error(f"Job {job_id}: missing 'file_url' in queue message — skipping")
+        return
+
+    # ── Download the PDF ──────────────────────────────────────────────────────
+    try:
+        if "blob.core.windows.net" in file_url:
+            connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+            if not connection_string:
+                raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not set")
+
+            from urllib.parse import urlparse
+            parsed_url = urlparse(file_url)
+            path_parts = parsed_url.path.lstrip("/").split("/", 1)
+            container_name = path_parts[0]
+            blob_name = path_parts[1] if len(path_parts) > 1 else ""
+
+            logging.info(f"Downloading from blob: container={container_name}, blob={blob_name}")
+            blob_service = BlobServiceClient.from_connection_string(connection_string)
+            blob_client = blob_service.get_blob_client(container_name, blob_name)
+            file_content = blob_client.download_blob().readall()
+        else:
+            import urllib.request
+            with urllib.request.urlopen(file_url) as response:
+                file_content = response.read()
+
+        logging.info(f"Downloaded PDF: {len(file_content)} bytes")
+    except Exception as dl_err:
+        logging.error(f"Job {job_id}: download failed — {dl_err}", exc_info=True)
+        raise  # Let Azure Functions retry
+
+    # ── Resolve floorplan name from URL if not provided ───────────────────────
+    if not floorplan_name:
+        from urllib.parse import urlparse
+        parsed_url = urlparse(file_url)
+        floorplan_name = parsed_url.path.split("/")[-1] or "floorplan.pdf"
+        if not floorplan_name.lower().endswith(".pdf"):
+            floorplan_name = "floorplan.pdf"
+
+    if not floorplan_name.lower().endswith(".pdf"):
+        logging.error(f"Job {job_id}: file is not a PDF ({floorplan_name}) — skipping")
+        return  # Don't retry — bad data
+
+    myblob_name = f"floor-plans/{floorplan_name}"
+
+    # Guard against nested PDFs (re-processing loop)
+    try:
+        relative_path = myblob_name.split("/", 1)[1]
+        if "/" in relative_path:
+            logging.info(f"Job {job_id}: skipping nested PDF '{relative_path}'")
+            return
+    except Exception:
+        pass
+
+    # ── Tiling configuration ──────────────────────────────────────────────────
+    PDF_SCALE      = 15.0
+    MAX_DIMENSION  = 30000
+    MAX_ZOOM_LIMIT = 15
+    FORCED_MAX_Z_ENV = 10
+    TILE_SIZE_ENV  = 512
+    MIN_ZOOM_ENV   = 0
+
+    if TILE_SIZE_ENV not in (128, 256, 512, 1024):
+        logging.warning(f"Unsupported TILE_SIZE={TILE_SIZE_ENV}; defaulting to 256")
+        TILE_SIZE_ENV = 256
+
+    logging.info(
+        f"Job {job_id} config — PDF_SCALE={PDF_SCALE}, MAX_DIM={MAX_DIMENSION}, "
+        f"ZOOM={MIN_ZOOM_ENV}-{FORCED_MAX_Z_ENV}, TILE={TILE_SIZE_ENV}px"
+    )
+
+    # ── 1. PDF → PIL Image ─────────────────────────────────────────────────────
+    images = pdf_to_images(file_content, scale=PDF_SCALE, max_dimension=MAX_DIMENSION)
+    if not images:
+        raise RuntimeError(f"Job {job_id}: no images generated from PDF")
+
+    floor_plan_image = images[0]
+    logging.info(f"Floor plan (pre-trim): {floor_plan_image.width}x{floor_plan_image.height}px")
+
+    for img in images[1:]:
+        img.close()
+
+    floor_plan_image = trim_whitespace(floor_plan_image, bg_color=(255, 255, 255), tolerance=10, padding=20)
+    logging.info(f"Floor plan (post-trim): {floor_plan_image.width}x{floor_plan_image.height}px")
+
+    # ── 2. Zoom levels ────────────────────────────────────────────────────────
+    FORCED_MAX_Z = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
+    max_zoom = FORCED_MAX_Z
+    min_zoom = max(0, min(MIN_ZOOM_ENV, max_zoom))
+    zoom_levels = list(range(min_zoom, max_zoom + 1))
+    logging.info(f"Zoom levels: {min_zoom}-{max_zoom}")
+
+    tile_size = TILE_SIZE_ENV
+    native_tiles_x = math.ceil(floor_plan_image.width / tile_size)
+    native_tiles_y = math.ceil(floor_plan_image.height / tile_size)
+    logging.info(f"Native tile grid at max zoom: {native_tiles_x}x{native_tiles_y}")
+
+    # ── 3. Tile pyramid ───────────────────────────────────────────────────────
+    logging.info("🗺️ Generating Simple CRS tile pyramid...")
+    floorplan_tiler = SimpleFloorplanTiler(tile_size=tile_size)
+    pyramid = floorplan_tiler.tile_image(floor_plan_image, zoom_levels)
+    total_tiles = sum(len(t) for t in pyramid.values())
+    logging.info(f"Generated {total_tiles} tiles across {len(pyramid)} zoom levels")
+
+    # ── 4. Preview + base image ───────────────────────────────────────────────
+    preview = generate_preview(floor_plan_image, max_width=800)
+
+    base_image_buffer = io.BytesIO()
+    try:
+        floor_plan_image.save(base_image_buffer, format="WebP", quality=85, method=4)
+        base_image_format = "webp"
+    except Exception:
+        base_image_buffer = io.BytesIO()
+        floor_plan_image.save(base_image_buffer, format="PNG", compress_level=6, optimize=True)
+        base_image_format = "png"
+
+    base_image_data = base_image_buffer.getvalue()
+    logging.info(f"Base image: {len(base_image_data)/(1024*1024):.2f} MB ({base_image_format.upper()})")
+
+    # ── 5. Metadata ───────────────────────────────────────────────────────────
+    floorplan_id = extract_floorplan_id(myblob_name)
+    metadata = create_metadata(
+        floor_plan_image, max_zoom, floorplan_id,
+        tile_size=tile_size, min_zoom=min_zoom, zoom_levels=zoom_levels
+    )
+    metadata["total_tiles"] = total_tiles
+    metadata["quality_settings"] = {
+        "pdf_scale": PDF_SCALE,
+        "max_dimension": MAX_DIMENSION,
+        "dpi": PDF_SCALE * 72,
+        "base_image_format": base_image_format,
+        "base_image_size_mb": round(len(base_image_data) / (1024*1024), 2)
+    }
+    metadata["job_id"] = job_id
+
+    # ── 6. Upload to blob storage ─────────────────────────────────────────────
+    connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if not connection_string:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not set — cannot upload")
+
+    upload_tiles_to_blob(
+        pyramid=pyramid,
+        preview=preview,
+        metadata=metadata,
+        floorplan_id=floorplan_id,
+        original_blob_name=myblob_name,
+        connection_string=connection_string,
+        container="floor-plans",
+        base_image=floor_plan_image,
+        base_image_data=base_image_data,
+        base_image_format=base_image_format
+    )
+
+    # Release memory
+    preview.close()
+    for zoom_tiles in pyramid.values():
+        for _, _, tile_img in zoom_tiles:
+            tile_img.close()
+    pyramid.clear()
+    logging.info("✅ Cleaned up image memory after upload")
+
+    # ── 7. Archive original PDF ───────────────────────────────────────────────
+    blob_service = BlobServiceClient.from_connection_string(connection_string)
+
+    try:
+        dest_blob_name = f"{floorplan_id}/{floorplan_id}.pdf"
+        dest_client = blob_service.get_blob_client("floor-plans", dest_blob_name)
+        dest_client.upload_blob(
+            file_content, overwrite=True,
+            content_settings=ContentSettings(content_type="application/pdf")
+        )
+        logging.info(f"Archived original PDF: {dest_blob_name}")
+    except Exception as copy_err:
+        logging.warning(f"Could not archive PDF: {copy_err}")
+
+    try:
+        relative_path = myblob_name.split("/", 1)[1]
+        if "/" not in relative_path:
+            src_client = blob_service.get_blob_client("floor-plans", relative_path)
+            src_client.delete_blob()
+            logging.info(f"Deleted root PDF: {relative_path}")
+    except Exception as del_err:
+        logging.warning(f"Could not delete original PDF: {del_err}")
+
+    logging.info(
+        f"🚀 Job {job_id} complete — {floorplan_id} | "
+        f"{floor_plan_image.width}x{floor_plan_image.height}px | "
+        f"{total_tiles} tiles | zoom {min_zoom}-{max_zoom}"
+    )
