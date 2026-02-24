@@ -17,8 +17,7 @@ import fitz  # PyMuPDF
 import httpx
 import uvicorn
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
-                     Request)
+from fastapi import (Depends, FastAPI, Header, HTTPException, Request)
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageChops
 from pydantic import BaseModel
@@ -83,12 +82,44 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         return
     
     try:
-        # Find the tiling-status record
+        # Step 1: Find the "tiling-status" information_id (MUST exist)
+        find_info_query = """
+        query FindTilingStatusInformation {
+          information(where: {name: {_eq: "tiling-status"}}) {
+            id
+          }
+        }
+        """
+        
+        info_response = httpx.post(
+            HASURA_GRAPHQL_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-hasura-admin-secret": HASURA_ADMIN_SECRET
+            },
+            json={"query": find_info_query},
+            timeout=10.0
+        )
+        info_response.raise_for_status()
+        info_data = info_response.json()
+        
+        if "errors" in info_data:
+            logger.error(f"Hasura query error: {info_data['errors']}")
+            return
+        
+        info_records = info_data.get("data", {}).get("information", [])
+        if not info_records:
+            logger.error("'tiling-status' information type not found in database. It MUST be created manually first.")
+            return
+        
+        information_id = info_records[0]["id"]
+        
+        # Step 2: Find the files_information record
         find_query = """
-        query FindTilingStatusInfo($files_id: Int!) {
+        query FindTilingStatusInfo($files_id: Int!, $information_id: Int!) {
           files_information(where: {
             files_id: {_eq: $files_id}
-            information: {name: {_eq: "tiling-status"}}
+            information_id: {_eq: $information_id}
           }) {
             id
           }
@@ -103,7 +134,7 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
             },
             json={
                 "query": find_query,
-                "variables": {"files_id": file_id}
+                "variables": {"files_id": file_id, "information_id": information_id}
             },
             timeout=10.0
         )
@@ -116,7 +147,48 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         
         records = find_data.get("data", {}).get("files_information", [])
         if not records:
-            logger.warning(f"No tiling-status record found for file_id={file_id}")
+            # Auto-create the tiling-status record if it doesn't exist
+            logger.info(f"Creating tiling-status record for file_id={file_id}")
+            create_mutation = """
+            mutation CreateTilingStatus($files_id: Int!, $information_id: Int!, $value: String!) {
+              insert_files_information_one(object: {
+                files_id: $files_id
+                information_id: $information_id
+                value: $value
+              }) {
+                id
+              }
+            }
+            """
+            
+            status_value = status
+            if error_message and status == "Error":
+                status_value = f"{status}: {error_message[:200]}"
+            
+            create_response = httpx.post(
+                HASURA_GRAPHQL_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-hasura-admin-secret": HASURA_ADMIN_SECRET
+                },
+                json={
+                    "query": create_mutation,
+                    "variables": {
+                        "files_id": file_id,
+                        "information_id": information_id,
+                        "value": status_value
+                    }
+                },
+                timeout=10.0
+            )
+            create_response.raise_for_status()
+            create_data = create_response.json()
+            
+            if "errors" in create_data:
+                logger.error(f"Failed to create tiling-status record: {create_data['errors']}")
+                return
+            
+            logger.info(f"✅ Created and set tiling status for file_id={file_id}: '{status_value}'")
             return
         
         record_id = records[0]["id"]
@@ -164,16 +236,12 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         logger.error(f"❌ Hasura update failed for file_id={file_id}: {str(e)}")
 
 
-# Job status tracking
+# Job status tracking (kept for backwards compatibility, not used in-memory)
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
-
-# In-memory job store (for simple implementation)
-jobs_store = {}
-jobs_lock = threading.Lock()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -615,21 +683,16 @@ async def health():
 
 @app.get("/api/status/{job_id}")
 async def get_job_status(job_id: str, api_key_valid: bool = Depends(verify_api_key)):
-    """Get the status of a processing job"""
-    with jobs_lock:
-        if job_id not in jobs_store:
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        job = jobs_store[job_id]
-        return {
-            "job_id": job_id,
-            "status": job["status"],
-            "progress": job.get("progress", 0),
-            "message": job.get("message", ""),
-            "created_at": job["created_at"],
-            "updated_at": job["updated_at"],
-            "result": job.get("result")
-        }
+    """
+    DEPRECATED: Job status endpoint no longer used.
+    Processing is now synchronous - status is returned directly from /api/process-floorplan.
+    
+    Check tiling-status in Hasura for current status.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="Job status endpoint deprecated. Processing is now synchronous. Check Hasura tiling-status for status."
+    )
 
 
 @app.delete("/api/delete-floorplan/{file_id}")
@@ -817,91 +880,57 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
 
 
 def update_job_progress(job_id: str, progress: int, message: str):
-    """Helper to update job progress"""
-    with jobs_lock:
-        if job_id in jobs_store:
-            jobs_store[job_id]["progress"] = progress
-            jobs_store[job_id]["message"] = message
-            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
-
-
-def process_floorplan_background(job_id: str, file_url: str, file_id: int, environment: str = "test"):
-    """Background task to process the floorplan"""
-    try:
-        # Update status to processing
-        with jobs_lock:
-            jobs_store[job_id]["status"] = JobStatus.PROCESSING
-            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
-        
-        # 1️⃣ START: Update Hasura status
-        update_tiling_status(file_id, "Tiling running")
-
-        # Call the synchronous processing logic
-        result = process_floorplan_sync(file_url, job_id, file_id, environment)
-
-        # Mark as completed
-        with jobs_lock:
-            jobs_store[job_id]["status"] = JobStatus.COMPLETED
-            jobs_store[job_id]["progress"] = 100
-            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
-            jobs_store[job_id]["message"] = "Processing completed successfully"
-            jobs_store[job_id]["result"] = result
-        
-        # 2️⃣ SUCCESS: Update Hasura status
-        update_tiling_status(file_id, "Tiling finished")
-
-    except Exception as e:
-        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
-        with jobs_lock:
-            jobs_store[job_id]["status"] = JobStatus.FAILED
-            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
-            jobs_store[job_id]["message"] = str(e)
-        
-        # 3️⃣ ERROR: Update Hasura status
-        update_tiling_status(file_id, "Error", error_message=str(e))
+    """Helper to update job progress (logs only, no in-memory store)"""
+    logger.info(f"Job {job_id} progress: {progress}% - {message}")
 
 
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks, api_key_valid: bool = Depends(verify_api_key)):
+async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Submit a PDF floorplan for processing (async - returns immediately).
+    Process a PDF floorplan synchronously (one container per request).
+    
+    Each HTTP request runs in its own container instance.
+    Azure Container Apps scales out automatically based on HTTP load.
 
     Args:
-        request: ProcessFloorplanRequest with file_url
+        request: ProcessFloorplanRequest with file_url, file_id, environment
 
     Returns:
-        JSON response with job_id for tracking progress
+        JSON response with floorplan metadata and tile information
     """
     # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
 
-    # Generate job ID
+    # Generate job ID for logging
     job_id = str(uuid.uuid4())
+    logger.info(f"Processing floorplan job {job_id} for file_id={request.file_id}")
 
-    # Create job record
-    now = datetime.utcnow().isoformat()
-    with jobs_lock:
-        jobs_store[job_id] = {
-            "job_id": job_id,
-            "file_url": request.file_url,
-            "status": JobStatus.QUEUED,
-            "progress": 0,
-            "message": "Job queued for processing",
-            "created_at": now,
-            "updated_at": now,
-            "result": None
-        }
+    try:
+        # 1️⃣ START: Update Hasura status
+        update_tiling_status(request.file_id, "Tiling running")
 
-    # Start background processing
-    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id, request.environment)
+        # Process synchronously - this container is dedicated to this request
+        result = process_floorplan_sync(request.file_url, job_id, request.file_id, request.environment)
+        
+        # 2️⃣ SUCCESS: Update Hasura status
+        update_tiling_status(request.file_id, "Tiling finished")
+        
+        return result
 
-    return {
-        "job_id": job_id,
-        "status": JobStatus.QUEUED,
-        "message": "Job queued for processing",
-        "status_url": f"/api/status/{job_id}"
-    }
+    except HTTPException:
+        # Re-raise HTTP exceptions (they already have proper status codes)
+        raise
+    except Exception as e:
+        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
+        
+        # 3️⃣ ERROR: Update Hasura status
+        update_tiling_status(request.file_id, "Error", error_message=str(e))
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Processing failed: {str(e)}"
+        )
 
 
 def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment: str = "test"):
@@ -918,65 +947,63 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
     Returns:
         Result dictionary with floorplan info
     """
-    update_job_progress(job_id, 5, "Downloading PDF...")
-
-    # Determine storage configuration based on environment
-    if environment.lower() == "production":
-        if not PRODUCTION_STORAGE_CONNECTION_STRING or not PRODUCTION_STORAGE_ACCOUNT_NAME:
+    # Determine storage connection string based on environment
+    if environment == "production":
+        connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
+        if not connection_string:
             raise HTTPException(
                 status_code=500,
-                detail="Production storage not configured. Please set PRODUCTION_STORAGE_CONNECTION_STRING and PRODUCTION_STORAGE_ACCOUNT_NAME environment variables."
+                detail="Production storage not configured"
             )
-        connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
-        storage_account_name = PRODUCTION_STORAGE_ACCOUNT_NAME
+        logger.info("Using PRODUCTION storage")
     else:
-        if not TEST_STORAGE_CONNECTION_STRING:
+        connection_string = TEST_STORAGE_CONNECTION_STRING
+        if not connection_string:
             raise HTTPException(
                 status_code=500,
                 detail="Test storage connection string not configured"
             )
-        connection_string = TEST_STORAGE_CONNECTION_STRING
-        storage_account_name = TEST_STORAGE_ACCOUNT_NAME
+        logger.info("Using TEST storage")
 
+    # Download the PDF
+    update_job_progress(job_id, 5, "Downloading PDF...")
     try:
-        # Download the PDF from Azure Blob Storage or URL
-        try:
-            # Check if it's an Azure Blob Storage URL
-            if 'blob.core.windows.net' in file_url:
-                # Parse the blob URL to extract storage account, container and blob name
-                from urllib.parse import urlparse
-                parsed_url = urlparse(file_url)
-                # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
-                source_storage_account = parsed_url.hostname.split('.')[0] if parsed_url.hostname else ''
-                path_parts = parsed_url.path.lstrip('/').split('/', 1)
-                container_name = path_parts[0]
-                blob_name = path_parts[1] if len(path_parts) > 1 else ''
+        # Check if it's an Azure Blob Storage URL
+        if 'blob.core.windows.net' in file_url:
+            # Parse the blob URL to extract storage account, container and blob name
+            from urllib.parse import urlparse
+            parsed_url = urlparse(file_url)
+            # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
+            source_storage_account = parsed_url.hostname.split('.')[0] if parsed_url.hostname else ''
+            path_parts = parsed_url.path.lstrip('/').split('/', 1)
+            container_name = path_parts[0]
+            blob_name = path_parts[1] if len(path_parts) > 1 else ''
 
-                # Determine which connection string to use based on source storage account
-                if source_storage_account.lower() == PRODUCTION_STORAGE_ACCOUNT_NAME.lower() if PRODUCTION_STORAGE_ACCOUNT_NAME else False:
-                    download_connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
-                else:
-                    download_connection_string = TEST_STORAGE_CONNECTION_STRING
-
-                if not download_connection_string:
-                    raise Exception(f"Storage connection string not configured for source account: {source_storage_account}")
-
-                blob_service = BlobServiceClient.from_connection_string(download_connection_string)
-                blob_client = blob_service.get_blob_client(container_name, blob_name)
-                file_content = blob_client.download_blob().readall()
-                update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
+            # Determine which connection string to use based on source storage account
+            if source_storage_account.lower() == PRODUCTION_STORAGE_ACCOUNT_NAME.lower() if PRODUCTION_STORAGE_ACCOUNT_NAME else False:
+                download_connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
             else:
-                # Download from external URL
-                import urllib.request
-                with urllib.request.urlopen(file_url) as response:
-                    file_content = response.read()
-                update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
-        except Exception as download_error:
-            logger.error(f"Error downloading file: {str(download_error)}", exc_info=True)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to download file: {str(download_error)}"
-            )
+                download_connection_string = TEST_STORAGE_CONNECTION_STRING
+
+            if not download_connection_string:
+                raise Exception(f"Storage connection string not configured for source account: {source_storage_account}")
+
+            blob_service = BlobServiceClient.from_connection_string(download_connection_string)
+            blob_client = blob_service.get_blob_client(container_name, blob_name)
+            file_content = blob_client.download_blob().readall()
+            update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
+        else:
+            # Download from external URL
+            import urllib.request
+            with urllib.request.urlopen(file_url) as response:
+                file_content = response.read()
+            update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
+    except Exception as download_error:
+        logger.error(f"Error downloading file: {str(download_error)}", exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download file: {str(download_error)}"
+        )
 
         # Validate PDF size to prevent OOM crashes
         file_size_mb = len(file_content) / (1024 * 1024)
