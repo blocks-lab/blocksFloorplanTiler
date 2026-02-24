@@ -17,6 +17,15 @@
     "storageConnectionString": {
       "value": "YOUR_STORAGE_CONNECTION_STRING"
     },
+    "hasuraGraphqlUrl": {
+      "value": "https://hasura-blocks-prod.blackpond-228bbd7d.germanywestcentral.azurecontainerapps.io/v1/graphql"
+    },
+    "hasuraAdminSecret": {
+      "value": "admin"
+    },
+    "apiKey": {
+      "value": "YOUR_API_KEY_HERE"
+    },
     "minReplicas": {
       "value": 1
     },

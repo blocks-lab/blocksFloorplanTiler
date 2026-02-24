@@ -24,6 +24,17 @@ param containerImage string
 @secure()
 param storageConnectionString string
 
+@description('Hasura GraphQL endpoint URL')
+param hasuraGraphqlUrl string = 'https://hasura-blocks-prod.blackpond-228bbd7d.germanywestcentral.azurecontainerapps.io/v1/graphql'
+
+@description('Hasura admin secret for authentication')
+@secure()
+param hasuraAdminSecret string
+
+@description('API key for securing the tiling service endpoints')
+@secure()
+param apiKey string = ''
+
 @description('Minimum number of replicas')
 @minValue(0)
 @maxValue(30)
@@ -115,6 +126,14 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'storage-connection-string'
           value: storageConnectionString
         }
+        {
+          name: 'hasura-admin-secret'
+          value: hasuraAdminSecret
+        }
+        {
+          name: 'api-key'
+          value: apiKey
+        }
       ]
     }
     template: {
@@ -130,6 +149,18 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             {
               name: 'AZURE_STORAGE_CONNECTION_STRING'
               secretRef: 'storage-connection-string'
+            }
+            {
+              name: 'HASURA_GRAPHQL_URL'
+              value: hasuraGraphqlUrl
+            }
+            {
+              name: 'HASURA_ADMIN_SECRET'
+              secretRef: 'hasura-admin-secret'
+            }
+            {
+              name: 'API_KEY'
+              secretRef: 'api-key'
             }
             {
               name: 'PORT'

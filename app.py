@@ -36,6 +36,10 @@ Image.MAX_IMAGE_PIXELS = None
 # API Key configuration
 API_KEY = os.environ.get("API_KEY", "")  # Set via environment variable
 
+# Hasura configuration for status updates
+HASURA_GRAPHQL_URL = os.environ.get("HASURA_GRAPHQL_URL", "https://hasura-blocks-prod.blackpond-228bbd7d.germanywestcentral.azurecontainerapps.io/v1/graphql")
+HASURA_ADMIN_SECRET = os.environ.get("HASURA_ADMIN_SECRET", "admin")
+
 # Storage configuration
 TEST_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")  # Test/dev storage
 TEST_STORAGE_ACCOUNT_NAME = os.environ.get("TEST_STORAGE_ACCOUNT_NAME", "blocksplayground")  # Default test account
@@ -62,6 +66,103 @@ def verify_api_key(x_api_key: str = Header(None)):
         )
 
     return True
+
+
+def update_tiling_status(file_id: int, status: str, error_message: Optional[str] = None):
+    """
+    Update tiling status in Hasura database via GraphQL mutation.
+    Simple synchronous function - just 3 calls: start, end, error
+    
+    Args:
+        file_id: The file ID to update
+        status: One of "Tiling running", "Tiling finished", "Error"
+        error_message: Optional error message if status is "Error"
+    """
+    if not HASURA_GRAPHQL_URL or not HASURA_ADMIN_SECRET:
+        logger.warning("Hasura configuration not set, skipping status update")
+        return
+    
+    try:
+        # Find the tiling-status record
+        find_query = """
+        query FindTilingStatusInfo($files_id: Int!) {
+          files_information(where: {
+            files_id: {_eq: $files_id}
+            information: {name: {_eq: "tiling-status"}}
+          }) {
+            id
+          }
+        }
+        """
+        
+        find_response = httpx.post(
+            HASURA_GRAPHQL_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-hasura-admin-secret": HASURA_ADMIN_SECRET
+            },
+            json={
+                "query": find_query,
+                "variables": {"files_id": file_id}
+            },
+            timeout=10.0
+        )
+        find_response.raise_for_status()
+        find_data = find_response.json()
+        
+        if "errors" in find_data:
+            logger.error(f"Hasura query error: {find_data['errors']}")
+            return
+        
+        records = find_data.get("data", {}).get("files_information", [])
+        if not records:
+            logger.warning(f"No tiling-status record found for file_id={file_id}")
+            return
+        
+        record_id = records[0]["id"]
+        
+        # Build status value
+        status_value = status
+        if error_message and status == "Error":
+            status_value = f"{status}: {error_message[:200]}"
+        
+        # Update the status
+        update_mutation = """
+        mutation UpdateTilingStatus($id: Int!, $value: String!) {
+          update_files_information_by_pk(
+            pk_columns: {id: $id}
+            _set: {value: $value}
+          ) {
+            id
+            value
+          }
+        }
+        """
+        
+        update_response = httpx.post(
+            HASURA_GRAPHQL_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-hasura-admin-secret": HASURA_ADMIN_SECRET
+            },
+            json={
+                "query": update_mutation,
+                "variables": {"id": record_id, "value": status_value}
+            },
+            timeout=10.0
+        )
+        update_response.raise_for_status()
+        update_data = update_response.json()
+        
+        if "errors" in update_data:
+            logger.error(f"Hasura mutation error: {update_data['errors']}")
+            return
+        
+        logger.info(f"✅ Updated tiling status for file_id={file_id}: '{status_value}'")
+        
+    except Exception as e:
+        logger.error(f"Error updating tiling status for file_id={file_id}: {str(e)}")
+
 
 # Job status tracking
 class JobStatus(str, Enum):
@@ -454,7 +555,7 @@ def upload_tiles_to_blob(
 
     # Upload preview
     preview_bytes = io.BytesIO()
-    preview.save(preview_bytes, format='JPEG', quality=75, optimize=True)
+    preview.save(preview_bytes, format='JPEG', quality=85, optimize=True)
     preview_bytes.seek(0)
     container_client.upload_blob(
         f"floorplans/{floorplan_id}/preview.jpg",
@@ -502,7 +603,7 @@ def upload_tiles_to_blob(
             )
 
             uploaded += 1
-            if uploaded % 10 == 0:
+            if uploaded % 50 == 0 or uploaded == total_tiles:
                 logger.info(f"Upload progress: {uploaded}/{total_tiles} tiles")
 
     logger.info(f"✅ Successfully uploaded {total_tiles} tiles for {floorplan_id}")
@@ -769,6 +870,9 @@ def process_floorplan_background(job_id: str, file_url: str, file_id: int, envir
         with jobs_lock:
             jobs_store[job_id]["status"] = JobStatus.PROCESSING
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        
+        # 1️⃣ START: Update Hasura status
+        update_tiling_status(file_id, "Tiling running")
 
         # Call the synchronous processing logic
         result = process_floorplan_sync(file_url, job_id, file_id, environment)
@@ -780,6 +884,9 @@ def process_floorplan_background(job_id: str, file_url: str, file_id: int, envir
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
             jobs_store[job_id]["message"] = "Processing completed successfully"
             jobs_store[job_id]["result"] = result
+        
+        # 2️⃣ SUCCESS: Update Hasura status
+        update_tiling_status(file_id, "Tiling finished")
 
     except Exception as e:
         logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
@@ -787,6 +894,9 @@ def process_floorplan_background(job_id: str, file_url: str, file_id: int, envir
             jobs_store[job_id]["status"] = JobStatus.FAILED
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
             jobs_store[job_id]["message"] = str(e)
+        
+        # 3️⃣ ERROR: Update Hasura status
+        update_tiling_status(file_id, "Error", error_message=str(e))
 
 
 @app.post("/api/process-floorplan")
@@ -801,6 +911,10 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
         JSON response with job_id for tracking progress
     """
     logger.info(f"Received floorplan processing request: {request.file_url}")
+
+    # Validate file URL
+    if not request.file_url.startswith(('http://', 'https://')):
+        raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
 
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -914,6 +1028,15 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
                 status_code=400,
                 detail=f"Failed to download file: {str(download_error)}"
             )
+
+        # Validate PDF size to prevent OOM crashes
+        file_size_mb = len(file_content) / (1024 * 1024)
+        if file_size_mb > 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PDF file too large ({file_size_mb:.1f}MB). Maximum allowed size is 100MB."
+            )
+        logger.info(f"PDF size validation passed: {file_size_mb:.2f}MB")
 
         # Extract filename from URL
         from urllib.parse import urlparse
@@ -1169,8 +1292,14 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
             images = [floor_plan_image]
 
         # Optional: auto-trim white margins
+        original_image = floor_plan_image
         floor_plan_image = trim_whitespace(floor_plan_image, bg_color=(255, 255, 255), tolerance=10, padding=20)
-        logger.info(f"Floor plan dimensions (post-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels")
+        # Release original image if trim created a new one
+        if original_image is not floor_plan_image:
+            original_image.close()
+            logger.info(f"Floor plan dimensions (post-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels (original released)")
+        else:
+            logger.info(f"Floor plan dimensions (no trim needed): {floor_plan_image.width}x{floor_plan_image.height} pixels")
 
         # 2. Calculate optimal zoom levels for Leaflet tiles
         tile_size = TILE_SIZE_ENV
@@ -1189,13 +1318,21 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
 
             optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
 
-            # Add ZOOM_BOOST extra levels for deeper zoom with upscaling
-            boosted_zoom = optimal_zoom + ZOOM_BOOST
+            # Adaptive zoom boost based on image size
+            # Large images benefit from deep zoom, small images don't need excessive upscaling
+            if max_dim > 20000:
+                adaptive_boost = ZOOM_BOOST  # Full boost for very large plans
+            elif max_dim > 10000:
+                adaptive_boost = max(3, ZOOM_BOOST - 1)  # Moderate boost
+            else:
+                adaptive_boost = max(2, ZOOM_BOOST - 2)  # Minimal boost for small images
+            
+            boosted_zoom = optimal_zoom + adaptive_boost
             max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
 
             logger.info(
                 f"🎯 Auto-calculated max zoom: {max_zoom} "
-                f"(native optimal: {optimal_zoom}, boost: +{ZOOM_BOOST}, "
+                f"(native optimal: {optimal_zoom}, adaptive boost: +{adaptive_boost}, "
                 f"image {floor_plan_image.width}x{floor_plan_image.height}, "
                 f"max_dim={max_dim})"
             )
