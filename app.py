@@ -7,17 +7,19 @@ import json
 import logging
 import math
 import os
+import threading
 import uuid
 from datetime import datetime
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import httpx
 import uvicorn
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from azure.storage.queue import QueueServiceClient
-from fastapi import (Depends, FastAPI, Header, HTTPException, Request)
-from fastapi.responses import JSONResponse, Response
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
+                     Request)
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageChops
 from pydantic import BaseModel
 
@@ -44,9 +46,6 @@ TEST_STORAGE_ACCOUNT_NAME = os.environ.get("TEST_STORAGE_ACCOUNT_NAME", "blocksp
 
 PRODUCTION_STORAGE_CONNECTION_STRING = os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")  # Production storage
 PRODUCTION_STORAGE_ACCOUNT_NAME = os.environ.get("PRODUCTION_STORAGE_ACCOUNT_NAME")  # Production account name
-
-# Queue configuration (for decoupling HTTP requests from tiling work)
-TILING_QUEUE_NAME = os.environ.get("TILING_QUEUE_NAME", "tiling-jobs")
 
 def verify_api_key(x_api_key: str = Header(None)):
     """Verify the API key from request header"""
@@ -238,41 +237,16 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         logger.error(f"❌ Hasura update failed for file_id={file_id}: {str(e)}")
 
 
-def enqueue_tiling_job(file_url: str, file_id: int, environment: str, job_id: str) -> None:
-    """
-    Push a tiling request onto Azure Storage Queue.
-    The worker Container App (scaled by KEDA) picks it up and processes it.
-    Returns immediately - status is tracked via Hasura tiling-status.
-    """
-    if not PRODUCTION_STORAGE_CONNECTION_STRING:
-        raise HTTPException(
-            status_code=500,
-            detail="Storage connection string not configured (PRODUCTION_STORAGE_CONNECTION_STRING)"
-        )
+# Job status tracking
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
-    try:
-        queue_service = QueueServiceClient.from_connection_string(PRODUCTION_STORAGE_CONNECTION_STRING)
-
-        # Ensure queue exists (idempotent - no-op if already created)
-        try:
-            queue_service.create_queue(TILING_QUEUE_NAME)
-            logger.info(f"📬 Created queue '{TILING_QUEUE_NAME}'")
-        except Exception:
-            pass  # Queue already exists
-
-        queue_client = queue_service.get_queue_client(TILING_QUEUE_NAME)
-        message = json.dumps({
-            "file_url": file_url,
-            "file_id": file_id,
-            "environment": environment,
-            "job_id": job_id,
-        })
-        queue_client.send_message(message)
-        logger.info(f"✅ Enqueued tiling job | file_id={file_id} | job_id={job_id}")
-
-    except Exception as e:
-        logger.error(f"❌ Failed to enqueue tiling job: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to enqueue tiling job: {str(e)}")
+# In-memory job store (for simple implementation)
+jobs_store = {}
+jobs_lock = threading.Lock()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -708,22 +682,27 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health probe - API container is always ready (tiling runs in isolated job containers)"""
+    """Kubernetes/Container Apps health probe"""
     return {"status": "healthy"}
 
 
 @app.get("/api/status/{job_id}")
 async def get_job_status(job_id: str, api_key_valid: bool = Depends(verify_api_key)):
-    """
-    DEPRECATED: Job status endpoint no longer used.
-    Processing is now synchronous - status is returned directly from /api/process-floorplan.
-    
-    Check tiling-status in Hasura for current status.
-    """
-    raise HTTPException(
-        status_code=410,
-        detail="Job status endpoint deprecated. Processing is now synchronous. Check Hasura tiling-status for status."
-    )
+    """Get the status of a processing job"""
+    with jobs_lock:
+        if job_id not in jobs_store:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        job = jobs_store[job_id]
+        return {
+            "job_id": job_id,
+            "status": job["status"],
+            "progress": job.get("progress", 0),
+            "message": job.get("message", ""),
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+            "result": job.get("result")
+        }
 
 
 @app.delete("/api/delete-floorplan/{file_id}")
@@ -911,35 +890,90 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
 
 
 def update_job_progress(job_id: str, progress: int, message: str):
-    """Helper to update job progress (logs only)"""
-    logger.info(f"Job {job_id} progress: {progress}% - {message}")
+    """Helper to update job progress"""
+    with jobs_lock:
+        if job_id in jobs_store:
+            jobs_store[job_id]["progress"] = progress
+            jobs_store[job_id]["message"] = message
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+
+
+def process_floorplan_background(job_id: str, file_url: str, file_id: int, environment: str = "test"):
+    """Background task to process the floorplan"""
+    try:
+        # Update status to processing
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.PROCESSING
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        
+        # 1️⃣ START: Update Hasura status
+        update_tiling_status(file_id, "Tiling running")
+
+        # Call the synchronous processing logic
+        result = process_floorplan_sync(file_url, job_id, file_id, environment)
+
+        # Mark as completed
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.COMPLETED
+            jobs_store[job_id]["progress"] = 100
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+            jobs_store[job_id]["message"] = "Processing completed successfully"
+            jobs_store[job_id]["result"] = result
+        
+        # 2️⃣ SUCCESS: Update Hasura status
+        update_tiling_status(file_id, "Tiling finished")
+
+    except Exception as e:
+        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.FAILED
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+            jobs_store[job_id]["message"] = str(e)
+        
+        # 3️⃣ ERROR: Update Hasura status
+        update_tiling_status(file_id, "Error", error_message=str(e))
 
 
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
+async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Queue a floorplan tiling request onto Azure Storage Queue.
-    The worker Container App (KEDA-scaled) picks it up and processes it.
-    Returns immediately - track progress via Hasura tiling-status.
+    Submit a PDF floorplan for processing (async - returns immediately).
+
+    Args:
+        request: ProcessFloorplanRequest with file_url
+
+    Returns:
+        JSON response with job_id for tracking progress
     """
+    # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid file URL - must be http:// or https://")
 
+    # Generate job ID
     job_id = str(uuid.uuid4())
-    logger.info(f"📥 Queuing tiling job | file_id={request.file_id} | job_id={job_id}")
 
-    enqueue_tiling_job(
-        request.file_url,
-        request.file_id,
-        request.environment,
-        job_id
-    )
+    # Create job record
+    now = datetime.utcnow().isoformat()
+    with jobs_lock:
+        jobs_store[job_id] = {
+            "job_id": job_id,
+            "file_url": request.file_url,
+            "status": JobStatus.QUEUED,
+            "progress": 0,
+            "message": "Job queued for processing",
+            "created_at": now,
+            "updated_at": now,
+            "result": None
+        }
+
+    # Start background processing
+    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id, request.environment)
 
     return {
-        "success": True,
         "job_id": job_id,
-        "file_id": request.file_id,
-        "message": "Tiling job queued. Worker will pick it up shortly. Check Hasura tiling-status for progress."
+        "status": JobStatus.QUEUED,
+        "message": "Job queued for processing",
+        "status_url": f"/api/status/{job_id}"
     }
 
 
@@ -957,416 +991,432 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
     Returns:
         Result dictionary with floorplan info
     """
-    # Determine storage connection string based on environment
-    if environment == "production":
-        connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
-        storage_account_name = PRODUCTION_STORAGE_ACCOUNT_NAME
-        if not connection_string:
+    update_job_progress(job_id, 5, "Downloading PDF...")
+
+    # Determine storage configuration based on environment
+    if environment.lower() == "production":
+        if not PRODUCTION_STORAGE_CONNECTION_STRING or not PRODUCTION_STORAGE_ACCOUNT_NAME:
             raise HTTPException(
                 status_code=500,
-                detail="Production storage not configured"
+                detail="Production storage not configured. Please set PRODUCTION_STORAGE_CONNECTION_STRING and PRODUCTION_STORAGE_ACCOUNT_NAME environment variables."
             )
-        logger.info("Using PRODUCTION storage")
+        connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
+        storage_account_name = PRODUCTION_STORAGE_ACCOUNT_NAME
     else:
-        connection_string = TEST_STORAGE_CONNECTION_STRING
-        storage_account_name = TEST_STORAGE_ACCOUNT_NAME
-        if not connection_string:
+        if not TEST_STORAGE_CONNECTION_STRING:
             raise HTTPException(
                 status_code=500,
                 detail="Test storage connection string not configured"
             )
-        logger.info("Using TEST storage")
+        connection_string = TEST_STORAGE_CONNECTION_STRING
+        storage_account_name = TEST_STORAGE_ACCOUNT_NAME
 
-    # Download the PDF
-    update_job_progress(job_id, 5, "Downloading PDF...")
     try:
-        # Check if it's an Azure Blob Storage URL
-        if 'blob.core.windows.net' in file_url:
-            # Parse the blob URL to extract storage account, container and blob name
-            from urllib.parse import urlparse
-            parsed_url = urlparse(file_url)
-            # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
-            source_storage_account = parsed_url.hostname.split('.')[0] if parsed_url.hostname else ''
-            path_parts = parsed_url.path.lstrip('/').split('/', 1)
-            container_name = path_parts[0]
-            blob_name = path_parts[1] if len(path_parts) > 1 else ''
+        # Download the PDF from Azure Blob Storage or URL
+        try:
+            # Check if it's an Azure Blob Storage URL
+            if 'blob.core.windows.net' in file_url:
+                # Parse the blob URL to extract storage account, container and blob name
+                from urllib.parse import urlparse
+                parsed_url = urlparse(file_url)
+                # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
+                source_storage_account = parsed_url.hostname.split('.')[0] if parsed_url.hostname else ''
+                path_parts = parsed_url.path.lstrip('/').split('/', 1)
+                container_name = path_parts[0]
+                blob_name = path_parts[1] if len(path_parts) > 1 else ''
 
-            # Determine which connection string to use based on source storage account
-            if source_storage_account.lower() == PRODUCTION_STORAGE_ACCOUNT_NAME.lower() if PRODUCTION_STORAGE_ACCOUNT_NAME else False:
-                download_connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
+                # Determine which connection string to use based on source storage account
+                if source_storage_account.lower() == PRODUCTION_STORAGE_ACCOUNT_NAME.lower() if PRODUCTION_STORAGE_ACCOUNT_NAME else False:
+                    download_connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
+                else:
+                    download_connection_string = TEST_STORAGE_CONNECTION_STRING
+
+                if not download_connection_string:
+                    raise Exception(f"Storage connection string not configured for source account: {source_storage_account}")
+
+                blob_service = BlobServiceClient.from_connection_string(download_connection_string)
+                blob_client = blob_service.get_blob_client(container_name, blob_name)
+                file_content = blob_client.download_blob().readall()
+                update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
             else:
-                download_connection_string = TEST_STORAGE_CONNECTION_STRING
+                # Download from external URL
+                import urllib.request
+                with urllib.request.urlopen(file_url) as response:
+                    file_content = response.read()
+                update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
+        except Exception as download_error:
+            logger.error(f"Error downloading file: {str(download_error)}", exc_info=True)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download file: {str(download_error)}"
+            )
 
-            if not download_connection_string:
-                raise Exception(f"Storage connection string not configured for source account: {source_storage_account}")
+        # Validate PDF size to prevent OOM crashes
+        file_size_mb = len(file_content) / (1024 * 1024)
+        if file_size_mb > 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PDF file too large ({file_size_mb:.1f}MB). Maximum allowed size is 100MB."
+            )
 
-            blob_service = BlobServiceClient.from_connection_string(download_connection_string)
-            blob_client = blob_service.get_blob_client(container_name, blob_name)
-            file_content = blob_client.download_blob().readall()
-            update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
+        # Extract filename from URL
+        from urllib.parse import urlparse
+        parsed_url = urlparse(file_url)
+        floorplan_name = parsed_url.path.split('/')[-1]
+        if not floorplan_name.lower().endswith('.pdf'):
+            floorplan_name = 'floorplan.pdf'
+
+        # Extract base name from filename (remove .pdf extension)
+        base_name = floorplan_name.rsplit('.', 1)[0]
+
+        # Create floorplan ID - just use file_id as folder name
+        floorplan_id = str(file_id)
+
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service.get_container_client("blocks")
+
+        # Check if any floorplan already exists with this file_id
+        prefix = f"floorplans/{file_id}/"
+        existing_blob = None
+
+        # Get iterator and check if any blob exists with this prefix
+        blob_iterator = container_client.list_blobs(name_starts_with=prefix)
+        try:
+            existing_blob = next(iter(blob_iterator), None)
+        except Exception as e:
+            logger.warning(f"Error checking for existing blobs: {e}")
+
+        if existing_blob:
+            # Found existing floorplan with this file_id, skip processing
+            logger.info(f"Floorplan already exists for file_id {file_id}, skipping processing")
+
+            # Extract the existing floorplan_id from the first blob path
+            existing_blob_path = existing_blob.name
+            existing_floorplan_id = existing_blob_path.split('/')[1]
+
+            return {
+                "success": True,
+                "message": "Floorplan already exists for this file_id",
+                "floorplan_id": existing_floorplan_id,
+                "environment": environment,
+                "urls": {
+                    "metadata": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/metadata.json",
+                    "preview": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/preview.jpg",
+                    "tiles": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+                }
+            }
+
+        # Create a mock blob name for compatibility
+        myblob_name = f"blocks/{floorplan_name}"
+
+        # ============================================================
+        # 🚀 PRODUCTION MODE - HIGH QUALITY TILING SETTINGS
+        # ============================================================
+
+        # 🎨 QUALITY SETTINGS (Configurable via environment variables):
+        PDF_SCALE = float(os.environ.get('PDF_SCALE', '40.0'))  # 40.0=2880 DPI (extreme quality for deep zoom)
+        MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
+
+        # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
+        MAX_ZOOM_LIMIT = 12      # Maximum zoom levels allowed
+        FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '-1'))  # -1 = auto-calculate based on image size
+        ZOOM_BOOST = int(os.environ.get('ZOOM_BOOST', '4'))  # Add extra zoom levels beyond native (for deep zoom with upscaling)
+        TILE_SIZE_ENV = int(os.environ.get('TILE_SIZE', '512'))  # 512px tiles
+        MIN_ZOOM_ENV = int(os.environ.get('MIN_ZOOM', '0'))  # Start from zoom level 0
+
+        # ✅ Deep zoom with upscaling beyond native resolution
+        # For PDF_SCALE=15: Native res at zoom ~6-7, upscales for 8-10
+        # For PDF_SCALE=40: Native res at zoom ~8-9, upscales for 10-12
+        # ============================================================
+
+        # Check if the file is a PDF
+        if not floorplan_name.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400,
+                detail="File must be a PDF"
+            )
+
+        # Guard: Only process PDFs uploaded at the container root to avoid re-processing
+        try:
+            container_and_rest = myblob_name.split('/', 1)
+            relative_path = container_and_rest[1] if len(container_and_rest) > 1 else myblob_name
+            if '/' in relative_path:
+                return JSONResponse(
+                    content={"success": True, "message": "Skipped nested PDF to prevent re-processing"},
+                    status_code=200
+                )
+        except Exception as _:
+            pass
+
+        # Validate TILE_SIZE to supported values
+        if TILE_SIZE_ENV not in (128, 256, 512, 1024):
+            logger.warning(f"Unsupported TILE_SIZE={TILE_SIZE_ENV}; defaulting to 256")
+            TILE_SIZE_ENV = 256
+
+        # SMART SCALING: Analyze PDF characteristics and determine optimal scale
+        # Check file size - simple documents are small, complex floorplans are large
+        file_size_mb = len(file_content) / (1024 * 1024)
+
+        # Open PDF to check dimensions and calculate appropriate quality
+        pdf_document = fitz.open(stream=file_content, filetype="pdf")
+        if pdf_document.page_count > 0:
+            page = pdf_document[0]
+            rect = page.rect
+            width_pt = rect.width
+            height_pt = rect.height
+
+            # Convert points to inches (72 points = 1 inch)
+            width_inches = width_pt / 72.0
+            height_inches = height_pt / 72.0
+            max_dimension_inches = max(width_inches, height_inches)
+
+            # Calculate aspect ratio
+            aspect_ratio = max(width_inches, height_inches) / min(width_inches, height_inches)
+
+            # Quick content analysis: Check if page has embedded images (raster content)
+            has_images = False
+            image_count = 0
+            try:
+                image_list = page.get_images(full=False)
+                image_count = len(image_list)
+                has_images = image_count > 0
+            except Exception:
+                pass
+
+            # File size heuristic: Small files are simple documents, large files are complex plans
+            is_complex_plan = file_size_mb > 0.5  # Files over 500KB are likely detailed plans
+
+            # INTELLIGENT SCALE SELECTION based on document characteristics
+            # Large architectural plans need high DPI for deep zoom
+            # Standard documents need moderate DPI for readability
+
+            # Large architectural drawings (3+ feet)
+            # Use high scale for deep zoom capability
+            if max_dimension_inches >= 36:
+                target_scale = PDF_SCALE  # Keep 40x (2880 DPI)
+                reason = "large architectural plan (36+ inches)"
+
+            # Medium architectural drawings (2-3 feet)
+            elif max_dimension_inches >= 24:
+                target_scale = min(PDF_SCALE, 30.0)  # Up to 30x (2160 DPI)
+                reason = "medium architectural plan (24-36 inches)"
+
+            # Large format documents (tabloid/A3)
+            # Boost scale for complex/detailed plans (large file size)
+            elif max_dimension_inches >= 17:
+                if has_images:
+                    target_scale = min(PDF_SCALE, 15.0)  # 15x (1080 DPI) for scans
+                else:
+                    # Complex vector plans get higher DPI
+                    target_scale = min(PDF_SCALE, 40.0 if is_complex_plan else 20.0)
+                reason = "large format document (17-24 inches)"
+
+            # Standard documents (letter/A4)
+            # Complex plans need more detail than simple documents
+            elif max_dimension_inches >= 11:
+                if has_images:
+                    target_scale = min(PDF_SCALE, 12.0)  # 12x (864 DPI) for scans
+                else:
+                    # Boost for complex vector plans with lots of detail
+                    target_scale = min(PDF_SCALE, 35.0 if is_complex_plan else 15.0)
+                reason = "standard document (11-17 inches)"
+
+            # Small documents
+            else:
+                target_scale = min(PDF_SCALE, 10.0)  # Up to 10x (720 DPI)
+                reason = "small document (<11 inches)"
+
+            # Content-based adjustment
+            if has_images:
+                reason += ", scanned/raster content"
+            else:
+                reason += ", vector/CAD content"
+
+            if is_complex_plan and max_dimension_inches < 36:
+                reason += " (complex/detailed)"
+
+            # Additional check: Extremely wide/tall aspect ratios (like long floorplans)
+            # need higher quality even if overall size is moderate
+            if aspect_ratio > 2.5 and max_dimension_inches >= 20:
+                target_scale = min(target_scale * 1.5, PDF_SCALE)
+                reason += " with extreme aspect ratio"
+
+            # Final safety check: Don't exceed memory limits
+            potential_width = int(width_pt * target_scale)
+            potential_height = int(height_pt * target_scale)
+            potential_pixels = potential_width * potential_height
+
+            MAX_SAFE_PIXELS = 300_000_000  # ~17,000 × 17,000 pixels
+            if potential_pixels > MAX_SAFE_PIXELS:
+                area_scale = (MAX_SAFE_PIXELS / potential_pixels) ** 0.5
+                target_scale = target_scale * area_scale
+                reason += " (reduced for memory safety)"
+
+            PDF_SCALE = target_scale
+
+        pdf_document.close()
+
+        # 1. Convert PDF to PNG (single page expected)
+        update_job_progress(job_id, 15, "Converting PDF to image...")
+        images = pdf_to_images(file_content, scale=PDF_SCALE, max_dimension=MAX_DIMENSION)
+
+        if len(images) == 0:
+            raise Exception("No images generated from PDF")
+
+        # Use first page (floor plans should be single page)
+        floor_plan_image = images[0]
+        update_job_progress(job_id, 20, "PDF converted, preparing image...")
+
+        # Release extra images from memory immediately
+        if len(images) > 1:
+            for img in images[1:]:
+                img.close()
+            images = [floor_plan_image]
+
+        # Optional: auto-trim white margins
+        original_image = floor_plan_image
+        floor_plan_image = trim_whitespace(floor_plan_image, bg_color=(255, 255, 255), tolerance=10, padding=20)
+        # Release original image if trim created a new one
+        if original_image is not floor_plan_image:
+            original_image.close()
+
+        # 2. Calculate optimal zoom levels for Leaflet tiles
+        tile_size = TILE_SIZE_ENV
+
+        # Calculate optimal max zoom based on image dimensions
+        # Goal: At max zoom, we want roughly 1-4 tiles per dimension (perfect native resolution)
+        if FORCED_MAX_Z_ENV == -1:
+            # Auto-calculate: Find zoom level where image fits in ~2-8 tiles per dimension
+            max_dim = max(floor_plan_image.width, floor_plan_image.height)
+
+            # Calculate tiles needed at zoom 0 (1 tile covers entire image)
+            # At each zoom level, tiles double: zoom 0 = 1 tile, zoom 1 = 2 tiles, zoom 2 = 4 tiles, etc.
+            # We want: tile_size * (2^zoom) ≈ max_dim
+            # So: 2^zoom ≈ max_dim / tile_size
+            # zoom ≈ log2(max_dim / tile_size)
+
+            optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
+
+            # Adaptive zoom boost based on image size
+            # Large images benefit from deep zoom, small images don't need excessive upscaling
+            if max_dim > 20000:
+                adaptive_boost = ZOOM_BOOST  # Full boost for very large plans
+            elif max_dim > 10000:
+                adaptive_boost = max(3, ZOOM_BOOST - 1)  # Moderate boost
+            else:
+                adaptive_boost = max(2, ZOOM_BOOST - 2)  # Minimal boost for small images
+            
+            boosted_zoom = optimal_zoom + adaptive_boost
+            max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
         else:
-            # Download from external URL
-            import urllib.request
-            with urllib.request.urlopen(file_url) as response:
-                file_content = response.read()
-            update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
-    except Exception as download_error:
-        logger.error(f"Error downloading file: {str(download_error)}", exc_info=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to download file: {str(download_error)}"
+            # Use forced max zoom from environment
+            max_zoom = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
+
+        min_zoom = max(0, min(MIN_ZOOM_ENV, max_zoom))
+        total_levels = (max_zoom - min_zoom + 1)
+
+        # 3. Generate tile pyramid using Simple CRS
+        update_job_progress(job_id, 30, f"Generating {total_levels} zoom levels of tiles...")
+
+        zoom_levels = list(range(min_zoom, max_zoom + 1))
+        floorplan_tiler = SimpleFloorplanTiler(tile_size=tile_size)
+        pyramid = floorplan_tiler.tile_image(floor_plan_image, zoom_levels)
+        total_tiles = sum(len(tiles) for tiles in pyramid.values())
+        update_job_progress(job_id, 60, f"Generated {total_tiles} tiles, uploading to storage...")
+
+        # 4. Generate preview image
+        preview = generate_preview(floor_plan_image, max_width=800)
+
+        # Skip base image to save memory - tiles are sufficient
+
+        # 5. Create metadata
+        metadata = create_metadata(
+            floor_plan_image,
+            max_zoom,
+            floorplan_id,
+            tile_size=tile_size,
+            min_zoom=min_zoom,
+            zoom_levels=zoom_levels,
+            file_id=file_id
         )
+        metadata["total_tiles"] = total_tiles
+        metadata["quality_settings"] = {
+            "pdf_scale": PDF_SCALE,
+            "max_dimension": MAX_DIMENSION,
+            "dpi": PDF_SCALE * 72
+        }
 
-    # Validate PDF size to prevent OOM crashes
-    file_size_mb = len(file_content) / (1024 * 1024)
-    if file_size_mb > 100:
-        raise HTTPException(
-            status_code=400,
-            detail=f"PDF file too large ({file_size_mb:.1f}MB). Maximum allowed size is 100MB."
+        # 6. Upload to blob storage
+        upload_tiles_to_blob(
+            pyramid=pyramid,
+            preview=preview,
+            metadata=metadata,
+            floorplan_id=floorplan_id,
+            original_blob_name=myblob_name,
+            connection_string=connection_string,
+            container="blocks",
+            base_image=None,
+            base_image_data=None,
+            base_image_format="png"
         )
+        update_job_progress(job_id, 90, f"Uploaded {total_tiles} tiles to storage...")
 
-    # Extract filename from URL
-    from urllib.parse import urlparse
-    parsed_url = urlparse(file_url)
-    floorplan_name = parsed_url.path.split('/')[-1]
-    if not floorplan_name.lower().endswith('.pdf'):
-        floorplan_name = 'floorplan.pdf'
+        # Release memory
+        preview.close()
+        for zoom_tiles in pyramid.values():
+            for _, _, tile_img in zoom_tiles:
+                tile_img.close()
+        pyramid.clear()
 
-    # Extract base name from filename (remove .pdf extension)
-    base_name = floorplan_name.rsplit('.', 1)[0]
+        # 7. Archive the original PDF
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        source_container = "blocks"
 
-    # Create floorplan ID - just use file_id as folder name
-    floorplan_id = str(file_id)
+        try:
+            dest_blob_name = f"floorplans/{floorplan_id}/{floorplan_id}.pdf"
+            dest_client = blob_service.get_blob_client(source_container, dest_blob_name)
+            content_settings = ContentSettings(content_type="application/pdf")
+            dest_client.upload_blob(file_content, overwrite=True, content_settings=content_settings)
+        except Exception as copy_err:
+            logger.warning(f"Could not store archived PDF copy: {str(copy_err)}")
 
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
+        update_job_progress(job_id, 95, "Finalizing floor plan processing...")
 
-    # Check if floorplan was already fully tiled by looking for metadata.json
-    # (Only metadata.json proves tiles were successfully generated - not just the archived PDF)
-    metadata_blob_name = f"floorplans/{file_id}/metadata.json"
-    already_tiled = False
-    try:
-        metadata_client = blob_service.get_blob_client("blocks", metadata_blob_name)
-        metadata_client.get_blob_properties()
-        already_tiled = True
-    except Exception:
-        already_tiled = False
-
-    if already_tiled:
-        logger.info(f"Floorplan already fully tiled for file_id={file_id}, skipping processing")
+        # Return success response
         return {
             "success": True,
-            "message": "Floorplan already exists for this file_id",
             "floorplan_id": floorplan_id,
             "environment": environment,
+            "storage_account": storage_account_name,
+            "dimensions": {
+                "width": floor_plan_image.width,
+                "height": floor_plan_image.height
+            },
+            "quality": {
+                "dpi": int(PDF_SCALE * 72)
+            },
+            "tiles": {
+                "total": total_tiles,
+                "zoom_levels": total_levels,
+                "min_zoom": min_zoom,
+                "max_zoom": max_zoom,
+                "tile_size": tile_size
+            },
             "urls": {
                 "metadata": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
-                "preview": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.jpg",
+                "preview": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.png",
                 "tiles": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
             }
         }
 
-    # Create a mock blob name for compatibility
-    myblob_name = f"blocks/{floorplan_name}"
-
-    # ============================================================
-    # 🚀 PRODUCTION MODE - HIGH QUALITY TILING SETTINGS
-    # ============================================================
-
-    # 🎨 QUALITY SETTINGS (Configurable via environment variables):
-    PDF_SCALE = float(os.environ.get('PDF_SCALE', '40.0'))  # 40.0=2880 DPI (extreme quality for deep zoom)
-    MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
-
-    # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
-    MAX_ZOOM_LIMIT = 12      # Maximum zoom levels allowed
-    FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '-1'))  # -1 = auto-calculate based on image size
-    ZOOM_BOOST = int(os.environ.get('ZOOM_BOOST', '4'))  # Add extra zoom levels beyond native (for deep zoom with upscaling)
-    TILE_SIZE_ENV = int(os.environ.get('TILE_SIZE', '512'))  # 512px tiles
-    MIN_ZOOM_ENV = int(os.environ.get('MIN_ZOOM', '0'))  # Start from zoom level 0
-
-    # ✅ Deep zoom with upscaling beyond native resolution
-    # For PDF_SCALE=15: Native res at zoom ~6-7, upscales for 8-10
-    # For PDF_SCALE=40: Native res at zoom ~8-9, upscales for 10-12
-    # ============================================================
-
-    # Check if the file is a PDF
-    if not floorplan_name.lower().endswith('.pdf'):
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=400,
-            detail="File must be a PDF"
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
         )
-
-    # Guard: Only process PDFs uploaded at the container root to avoid re-processing
-    try:
-        container_and_rest = myblob_name.split('/', 1)
-        relative_path = container_and_rest[1] if len(container_and_rest) > 1 else myblob_name
-        if '/' in relative_path:
-            return JSONResponse(
-                content={"success": True, "message": "Skipped nested PDF to prevent re-processing"},
-                status_code=200
-            )
-    except Exception as _:
-        pass
-
-    # Validate TILE_SIZE to supported values
-    if TILE_SIZE_ENV not in (128, 256, 512, 1024):
-        logger.warning(f"Unsupported TILE_SIZE={TILE_SIZE_ENV}; defaulting to 256")
-        TILE_SIZE_ENV = 256
-
-    # SMART SCALING: Analyze PDF characteristics and determine optimal scale
-    # Check file size - simple documents are small, complex floorplans are large
-    file_size_mb = len(file_content) / (1024 * 1024)
-
-    # Open PDF to check dimensions and calculate appropriate quality
-    pdf_document = fitz.open(stream=file_content, filetype="pdf")
-    if pdf_document.page_count > 0:
-        page = pdf_document[0]
-        rect = page.rect
-        width_pt = rect.width
-        height_pt = rect.height
-
-        # Convert points to inches (72 points = 1 inch)
-        width_inches = width_pt / 72.0
-        height_inches = height_pt / 72.0
-        max_dimension_inches = max(width_inches, height_inches)
-
-        # Calculate aspect ratio
-        aspect_ratio = max(width_inches, height_inches) / min(width_inches, height_inches)
-
-        # Quick content analysis: Check if page has embedded images (raster content)
-        has_images = False
-        image_count = 0
-        try:
-            image_list = page.get_images(full=False)
-            image_count = len(image_list)
-            has_images = image_count > 0
-        except Exception:
-            pass
-
-        # File size heuristic: Small files are simple documents, large files are complex plans
-        is_complex_plan = file_size_mb > 0.5  # Files over 500KB are likely detailed plans
-
-        # INTELLIGENT SCALE SELECTION based on document characteristics
-        # Large architectural plans need high DPI for deep zoom
-        # Standard documents need moderate DPI for readability
-
-        # Large architectural drawings (3+ feet)
-        # Use high scale for deep zoom capability
-        if max_dimension_inches >= 36:
-            target_scale = PDF_SCALE  # Keep 40x (2880 DPI)
-            reason = "large architectural plan (36+ inches)"
-
-        # Medium architectural drawings (2-3 feet)
-        elif max_dimension_inches >= 24:
-            target_scale = min(PDF_SCALE, 30.0)  # Up to 30x (2160 DPI)
-            reason = "medium architectural plan (24-36 inches)"
-
-        # Large format documents (tabloid/A3)
-        # Boost scale for complex/detailed plans (large file size)
-        elif max_dimension_inches >= 17:
-            if has_images:
-                target_scale = min(PDF_SCALE, 15.0)  # 15x (1080 DPI) for scans
-            else:
-                # Complex vector plans get higher DPI
-                target_scale = min(PDF_SCALE, 40.0 if is_complex_plan else 20.0)
-            reason = "large format document (17-24 inches)"
-
-        # Standard documents (letter/A4)
-        # Complex plans need more detail than simple documents
-        elif max_dimension_inches >= 11:
-            if has_images:
-                target_scale = min(PDF_SCALE, 12.0)  # 12x (864 DPI) for scans
-            else:
-                # Boost for complex vector plans with lots of detail
-                target_scale = min(PDF_SCALE, 35.0 if is_complex_plan else 15.0)
-            reason = "standard document (11-17 inches)"
-
-        # Small documents
-        else:
-            target_scale = min(PDF_SCALE, 10.0)  # Up to 10x (720 DPI)
-            reason = "small document (<11 inches)"
-
-        # Content-based adjustment
-        if has_images:
-            reason += ", scanned/raster content"
-        else:
-            reason += ", vector/CAD content"
-
-        if is_complex_plan and max_dimension_inches < 36:
-            reason += " (complex/detailed)"
-
-        # Additional check: Extremely wide/tall aspect ratios (like long floorplans)
-        # need higher quality even if overall size is moderate
-        if aspect_ratio > 2.5 and max_dimension_inches >= 20:
-            target_scale = min(target_scale * 1.5, PDF_SCALE)
-            reason += " with extreme aspect ratio"
-
-        # Final safety check: Don't exceed memory limits
-        potential_width = int(width_pt * target_scale)
-        potential_height = int(height_pt * target_scale)
-        potential_pixels = potential_width * potential_height
-
-        MAX_SAFE_PIXELS = 300_000_000  # ~17,000 × 17,000 pixels
-        if potential_pixels > MAX_SAFE_PIXELS:
-            area_scale = (MAX_SAFE_PIXELS / potential_pixels) ** 0.5
-            target_scale = target_scale * area_scale
-            reason += " (reduced for memory safety)"
-
-        PDF_SCALE = target_scale
-
-    pdf_document.close()
-
-    # 1. Convert PDF to PNG (single page expected)
-    update_job_progress(job_id, 15, "Converting PDF to image...")
-    images = pdf_to_images(file_content, scale=PDF_SCALE, max_dimension=MAX_DIMENSION)
-
-    if len(images) == 0:
-        raise Exception("No images generated from PDF")
-
-    # Use first page (floor plans should be single page)
-    floor_plan_image = images[0]
-    update_job_progress(job_id, 20, "PDF converted, preparing image...")
-
-    # Release extra images from memory immediately
-    if len(images) > 1:
-        for img in images[1:]:
-            img.close()
-        images = [floor_plan_image]
-
-    # Optional: auto-trim white margins
-    original_image = floor_plan_image
-    floor_plan_image = trim_whitespace(floor_plan_image, bg_color=(255, 255, 255), tolerance=10, padding=20)
-    # Release original image if trim created a new one
-    if original_image is not floor_plan_image:
-        original_image.close()
-
-    # 2. Calculate optimal zoom levels for Leaflet tiles
-    tile_size = TILE_SIZE_ENV
-
-    # Calculate optimal max zoom based on image dimensions
-    # Goal: At max zoom, we want roughly 1-4 tiles per dimension (perfect native resolution)
-    if FORCED_MAX_Z_ENV == -1:
-        # Auto-calculate: Find zoom level where image fits in ~2-8 tiles per dimension
-        max_dim = max(floor_plan_image.width, floor_plan_image.height)
-
-        # Calculate tiles needed at zoom 0 (1 tile covers entire image)
-        # At each zoom level, tiles double: zoom 0 = 1 tile, zoom 1 = 2 tiles, zoom 2 = 4 tiles, etc.
-        # We want: tile_size * (2^zoom) ≈ max_dim
-        # So: 2^zoom ≈ max_dim / tile_size
-        # zoom ≈ log2(max_dim / tile_size)
-
-        optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
-
-        # Adaptive zoom boost based on image size
-        # Large images benefit from deep zoom, small images don't need excessive upscaling
-        if max_dim > 20000:
-            adaptive_boost = ZOOM_BOOST  # Full boost for very large plans
-        elif max_dim > 10000:
-            adaptive_boost = max(3, ZOOM_BOOST - 1)  # Moderate boost
-        else:
-            adaptive_boost = max(2, ZOOM_BOOST - 2)  # Minimal boost for small images
-        
-        boosted_zoom = optimal_zoom + adaptive_boost
-        max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
-    else:
-        # Use forced max zoom from environment
-        max_zoom = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
-
-    min_zoom = max(0, min(MIN_ZOOM_ENV, max_zoom))
-    total_levels = (max_zoom - min_zoom + 1)
-
-    # 3. Generate tile pyramid using Simple CRS
-    update_job_progress(job_id, 30, f"Generating {total_levels} zoom levels of tiles...")
-
-    zoom_levels = list(range(min_zoom, max_zoom + 1))
-    floorplan_tiler = SimpleFloorplanTiler(tile_size=tile_size)
-    pyramid = floorplan_tiler.tile_image(floor_plan_image, zoom_levels)
-    total_tiles = sum(len(tiles) for tiles in pyramid.values())
-    update_job_progress(job_id, 60, f"Generated {total_tiles} tiles, uploading to storage...")
-
-    # 4. Generate preview image
-    preview = generate_preview(floor_plan_image, max_width=800)
-
-    # Skip base image to save memory - tiles are sufficient
-
-    # 5. Create metadata
-    metadata = create_metadata(
-        floor_plan_image,
-        max_zoom,
-        floorplan_id,
-        tile_size=tile_size,
-        min_zoom=min_zoom,
-        zoom_levels=zoom_levels,
-        file_id=file_id
-    )
-    metadata["total_tiles"] = total_tiles
-    metadata["quality_settings"] = {
-        "pdf_scale": PDF_SCALE,
-        "max_dimension": MAX_DIMENSION,
-        "dpi": PDF_SCALE * 72
-    }
-
-    # 6. Upload to blob storage
-    upload_tiles_to_blob(
-        pyramid=pyramid,
-        preview=preview,
-        metadata=metadata,
-        floorplan_id=floorplan_id,
-        original_blob_name=myblob_name,
-        connection_string=connection_string,
-        container="blocks",
-        base_image=None,
-        base_image_data=None,
-        base_image_format="png"
-    )
-    update_job_progress(job_id, 90, f"Uploaded {total_tiles} tiles to storage...")
-
-    # Release memory
-    preview.close()
-    for zoom_tiles in pyramid.values():
-        for _, _, tile_img in zoom_tiles:
-            tile_img.close()
-    pyramid.clear()
-
-    # 7. Archive the original PDF
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
-    source_container = "blocks"
-
-    try:
-        dest_blob_name = f"floorplans/{floorplan_id}/{floorplan_id}.pdf"
-        dest_client = blob_service.get_blob_client(source_container, dest_blob_name)
-        content_settings = ContentSettings(content_type="application/pdf")
-        dest_client.upload_blob(file_content, overwrite=True, content_settings=content_settings)
-    except Exception as copy_err:
-        logger.warning(f"Could not store archived PDF copy: {str(copy_err)}")
-
-    update_job_progress(job_id, 95, "Finalizing floor plan processing...")
-
-    # Return success response
-    return {
-        "success": True,
-        "floorplan_id": floorplan_id,
-        "environment": environment,
-        "storage_account": storage_account_name,
-        "dimensions": {
-            "width": floor_plan_image.width,
-            "height": floor_plan_image.height
-        },
-        "quality": {
-            "dpi": int(PDF_SCALE * 72)
-        },
-        "tiles": {
-            "total": total_tiles,
-            "zoom_levels": total_levels,
-            "min_zoom": min_zoom,
-            "max_zoom": max_zoom,
-            "tile_size": tile_size
-        },
-        "urls": {
-            "metadata": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
-            "preview": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.png",
-            "tiles": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
-        }
-    }
 
 
 import pdf_annotation
