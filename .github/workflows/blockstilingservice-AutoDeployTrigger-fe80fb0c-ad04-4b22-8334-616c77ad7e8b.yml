@@ -79,10 +79,12 @@ jobs:
             --cpu 2 --memory 4Gi \
             --command "python" "worker.py" \
             --min-replicas 0 --max-replicas 1 \
-            --secrets "storage-connection-string=${STORAGE_CONN}" \
+            --secrets \
+              "storage-connection-string=${STORAGE_CONN}" \
+              "production-storage-connection-string=${PROD_STORAGE_CONN}" \
             --env-vars \
               "AZURE_STORAGE_CONNECTION_STRING=secretref:storage-connection-string" \
-              "PRODUCTION_STORAGE_CONNECTION_STRING=${PROD_STORAGE_CONN}" \
+              "PRODUCTION_STORAGE_CONNECTION_STRING=secretref:production-storage-connection-string" \
               "PRODUCTION_STORAGE_ACCOUNT_NAME=productionstorageblocks" \
               "TEST_STORAGE_ACCOUNT_NAME=blocksplayground" \
               "HASURA_GRAPHQL_URL=https://hasura-blocks-prod.blackpond-228bbd7d.germanywestcentral.azurecontainerapps.io/v1/graphql" \
@@ -92,7 +94,7 @@ jobs:
             --scale-rule-name queue-rule \
             --scale-rule-type azure-queue \
             --scale-rule-metadata "queueName=tiling-jobs" "queueLength=1" \
-            --scale-rule-auth "connection=storage-connection-string" 2>/dev/null || \
+            --scale-rule-auth "connection=production-storage-connection-string" 2>/dev/null || \
           # Update existing worker Container App with new image
           az containerapp update \
             --name blockstilingservice-worker \

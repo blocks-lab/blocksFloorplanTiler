@@ -11,9 +11,9 @@ Sequential processing (maxReplicas=1) means only one PDF is tiled at a time,
 so memory usage is predictable and OOM crashes are impossible.
 
 Required environment variables:
-  AZURE_STORAGE_CONNECTION_STRING       - queue + test blob storage
+  PRODUCTION_STORAGE_CONNECTION_STRING  - queue storage (tiling-jobs queue lives here)
   TILING_QUEUE_NAME                     - queue name (default: tiling-jobs)
-  PRODUCTION_STORAGE_CONNECTION_STRING  - production blob storage
+  AZURE_STORAGE_CONNECTION_STRING       - test blob storage
   PRODUCTION_STORAGE_ACCOUNT_NAME       - production account name
   TEST_STORAGE_ACCOUNT_NAME             - test account name
   HASURA_GRAPHQL_URL                    - for tiling status updates

@@ -9,7 +9,6 @@ import math
 import os
 import uuid
 from datetime import datetime
-from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
@@ -237,14 +236,6 @@ def update_tiling_status(file_id: int, status: str, error_message: Optional[str]
         
     except Exception as e:
         logger.error(f"❌ Hasura update failed for file_id={file_id}: {str(e)}")
-
-
-# Job status tracking (kept for backwards compatibility)
-class JobStatus(str, Enum):
-    QUEUED = "queued"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
 
 
 def enqueue_tiling_job(file_url: str, file_id: int, environment: str, job_id: str) -> None:

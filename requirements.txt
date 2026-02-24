@@ -21,6 +21,3 @@ azure-storage-queue==12.9.0
 
 # Optional: Async support for better performance
 httpx==0.26.0
-
-# Azure Functions
-azure-functions
