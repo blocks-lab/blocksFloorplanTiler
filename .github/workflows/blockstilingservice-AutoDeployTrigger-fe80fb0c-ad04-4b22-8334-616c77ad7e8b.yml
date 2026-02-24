@@ -70,12 +70,18 @@ jobs:
             --resource-group KompassExperimental \
             --query "[0].name" -o tsv)
 
+          # Fetch ACR admin password (used for worker image pull credentials)
+          ACR_PASSWORD=$(az acr credential show --name ca285afb5d06acr --query "passwords[0].value" -o tsv)
+
           # Create worker Container App if it doesn't exist yet (sets up KEDA queue scaler)
           az containerapp create \
             --name blockstilingservice-worker \
             --resource-group KompassExperimental \
             --environment "${CA_ENV}" \
             --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG} \
+            --registry-server ca285afb5d06acr.azurecr.io \
+            --registry-username ca285afb5d06acr \
+            --registry-password "${ACR_PASSWORD}" \
             --cpu 2 --memory 4Gi \
             --command "python" "worker.py" \
             --min-replicas 0 --max-replicas 1 \
