@@ -38,12 +38,12 @@ param apiKey string = ''
 @description('Minimum number of replicas')
 @minValue(0)
 @maxValue(30)
-param minReplicas int = 1
+param minReplicas int = 0
 
 @description('Maximum number of replicas')
 @minValue(1)
-@maxValue(30)
-param maxReplicas int = 10
+@maxValue(1000)
+param maxReplicas int = 50
 
 @description('CPU cores per container instance')
 @allowed([
@@ -200,12 +200,14 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       scale: {
         minReplicas: minReplicas
         maxReplicas: maxReplicas
+        cooldownPeriodInSeconds: 300
+        pollingIntervalInSeconds: 30
         rules: [
           {
-            name: 'http-scaling-rule'
+            name: 'http-rule'
             http: {
               metadata: {
-                concurrentRequests: '10'
+                concurrentRequests: '1'
               }
             }
           }

@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import threading
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -241,6 +242,11 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+
+# Prevents 2 tiling jobs from running simultaneously on the same container instance.
+# If a second request lands on a busy container before Azure CA scales out,
+# it fails fast so the caller can retry (and hit a fresh container).
+_container_tiling_lock = threading.Semaphore(1)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -885,6 +891,15 @@ def update_job_progress(job_id: str, progress: int, message: str):
 
 def process_floorplan_background(file_url: str, job_id: str, file_id: int, environment: str):
     """Background task to process the floorplan - runs in dedicated container"""
+    # Prevent 2 heavy tiling jobs from running concurrently on the same container.
+    # Non-blocking: if a job is already running here, fail fast so the caller can retry
+    # on a fresh container (Azure CA will have scaled out by then).
+    acquired = _container_tiling_lock.acquire(blocking=False)
+    if not acquired:
+        logger.warning(f"⚠️ Container already busy with a tiling job. Rejecting job {job_id} for file_id={file_id}. Caller should retry.")
+        update_tiling_status(file_id, "Error", error_message="Container busy with another tiling job. Please retry in a few seconds.")
+        return
+
     try:
         # 1️⃣ START: Update Hasura status
         update_tiling_status(file_id, "Tiling running")
@@ -902,6 +917,9 @@ def process_floorplan_background(file_url: str, job_id: str, file_id: int, envir
         
         # 3️⃣ ERROR: Update Hasura status
         update_tiling_status(file_id, "Error", error_message=str(e))
+
+    finally:
+        _container_tiling_lock.release()
 
 
 @app.post("/api/process-floorplan")
