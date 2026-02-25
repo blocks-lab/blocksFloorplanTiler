@@ -862,15 +862,15 @@ def process_floorplan_background(job_id: str, file_url: str, file_id: int, envir
 
 
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks, api_key_valid: bool = Depends(verify_api_key)):
+async def process_floorplan(request: ProcessFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Submit a PDF floorplan for processing (async - returns immediately).
+    Process a PDF floorplan synchronously - holds the HTTP request open until tiling is complete.
 
     Args:
         request: ProcessFloorplanRequest with file_url
 
     Returns:
-        JSON response with job_id for tracking progress
+        JSON response with job result
     """
     # Validate file URL
     if not request.file_url.startswith(('http://', 'https://')):
@@ -893,14 +893,20 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
             "result": None
         }
 
-    # Start background processing
-    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id, request.environment)
+    # Process synchronously - blocks until tiling is done
+    process_floorplan_background(job_id, request.file_url, request.file_id, request.environment)
+
+    with jobs_lock:
+        job = jobs_store.get(job_id, {})
+
+    if job.get("status") == JobStatus.FAILED:
+        raise HTTPException(status_code=500, detail=job.get("message", "Tiling failed"))
 
     return {
         "job_id": job_id,
-        "status": JobStatus.QUEUED,
-        "message": "Job queued for processing",
-        "status_url": f"/api/status/{job_id}"
+        "status": job.get("status"),
+        "message": job.get("message"),
+        "result": job.get("result")
     }
 
 
