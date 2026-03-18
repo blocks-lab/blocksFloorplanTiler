@@ -581,6 +581,16 @@ def register_routes(app: func.FunctionApp):
                     mimetype="application/json"
                 )
 
+            # If file_url doesn't point to a PDF, derive the PDF path from metadata_url.
+            # metadata_url pattern: .../floorplans/{file_id}/metadata.json
+            # PDF pattern:          .../floorplans/{file_id}/{file_id}.pdf
+            if not file_url.lower().endswith(".pdf"):
+                base_dir = metadata_url.rsplit("/", 1)[0]  # strip "metadata.json"
+                file_id = base_dir.rsplit("/", 1)[-1]       # last path segment = file_id
+                derived_pdf_url = f"{base_dir}/{file_id}.pdf"
+                logging.info(f"⚠️  file_url is not a PDF ({file_url}), deriving PDF URL: {derived_pdf_url}")
+                file_url = derived_pdf_url
+
             logging.info(f"📝 Starting PDF annotation")
             logging.info(f"   PDF URL: {file_url}")
             logging.info(f"   Metadata URL: {metadata_url}")
