@@ -606,27 +606,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Force all annotation appearance streams to be written correctly,
-    # then set NeedAppearances=false so PDF viewers (Acrobat) use our
-    # stored /AP streams instead of regenerating with their own defaults.
-    for annot in page.annots():
-        annot.update()
-
-    try:
-        cat_xref = doc.pdf_catalog()
-        acroform = doc.xref_get_key(cat_xref, "AcroForm")
-        if acroform[0] == "xref":
-            axref = int(acroform[1].split()[0])
-            doc.xref_set_key(axref, "NeedAppearances", "false")
-        else:
-            doc.xref_set_key(cat_xref, "AcroForm", "<</NeedAppearances false>>")
-        logging.info("✅ NeedAppearances set to false")
-    except Exception as na_err:
-        logging.warning(f"Could not set NeedAppearances=false: {na_err}")
-
-    # Save to bytes
+    # Save to bytes — deflate=True compresses streams and is required for
+    # appearance streams to be written correctly into the output file.
     output = io.BytesIO()
-    doc.save(output)
+    doc.save(output, deflate=True)
     doc.close()
 
     return output.getvalue()
