@@ -607,18 +607,18 @@ def place_callout_annotation(
 #     V04  update(text_color=Y)
 #     V05  update(fill_color=Y)  [yellow box]
 #     V06  update(text_color=Y) + update(fill_color=Y)
-#   Row 3 – set_colors()
-#     V07  set_colors(stroke=(1,1,0))   — no update
-#     V08  set_colors(stroke=(1,1,0)) + update()
-#     V09  set_colors(stroke=(1,1,0)) + update(fill_color=(0,0,0))
-#   Row 4 – xref_set_key direct PDF dict
-#     V10  xref "C"="[1 1 0]"   — no update
-#     V11  xref "C"="[1 1 0]" + update()          ← current production fix
-#     V12  xref "C"="[1 1 0]" + update(fill_color=(0,0,0))
-#   Row 5 – combined / edge cases
-#     V13  set_colors(Y) → xref C=[0 1 0] (green) + update()  [who wins?]
-#     V14  xref C=[1 1 0] + xref IC=[0 0 0] + update()  [both keys via xref]
-#     V15  fill=(0,0,1) [blue box] + xref C=[1 1 0] + update()
+#   Row 3 – xref /C only (no update — does AP rebuild happen automatically?)
+#     V07  xref C=yellow, no update()
+#     V08  xref C=red,    no update()
+#     V09  xref C=green,  no update()
+#   Row 4 – xref /C + update() (forces AP stream rebuild)
+#     V10  xref C=yellow + update()
+#     V11  xref C=red    + update()
+#     V12  xref C=green  + update()
+#   Row 5 – xref /C + update() combined
+#     V13  xref C=yellow + update(fill_color=black)
+#     V14  xref C=yellow + xref IC=black + update()
+#     V15  ctor fill=blue + xref C=yellow + update()
 # ──────────────────────────────────────────────────────────────────────────────
 def _diag_callout_variants(page: fitz.Page) -> None:
     """Render 15 FreeText callout annotation variants at top-left of page."""
@@ -643,16 +643,16 @@ def _diag_callout_variants(page: fitz.Page) -> None:
         ("V04", "update(\ntext_color=Y)",             {},                       ["upd_tc_Y"]),
         ("V05", "update(\nfill_color=Y)",             {},                       ["upd_fill_Y"]),
         ("V06", "upd(tc=Y)\n+ upd(fill=Y)",          {},                       ["upd_tc_Y", "upd_fill_Y"]),
-        # Row 3 – set_colors()
-        ("V07", "set_colors(Y)\nno update",           {},                       ["sc_stroke_Y"]),
-        ("V08", "set_colors(Y)\n+ update()",          {},                       ["sc_stroke_Y", "update"]),
-        ("V09", "set_colors(Y)\n+ upd(fill=K)",       {},                       ["sc_stroke_Y", "upd_fill_K"]),
-        # Row 4 – xref_set_key direct PDF dict
-        ("V10", "xref C=Y\nno update",                {},                       ["xref_C_Y"]),
-        ("V11", "xref C=Y\n+ update()",               {},                       ["xref_C_Y", "update"]),
-        ("V12", "xref C=Y\n+ upd(fill=K)",            {},                       ["xref_C_Y", "upd_fill_K"]),
-        # Row 5 – combined / edge cases
-        ("V13", "sc(Y)+xref C=G\n+ upd (green?)",    {},                       ["sc_stroke_Y", "xref_C_G", "update"]),
+        # Row 3 – xref /C only (no update)
+        ("V07", "xref C=Y\nno update",                {},                       ["xref_C_Y"]),
+        ("V08", "xref C=R\nno update",                {},                       ["xref_C_R"]),
+        ("V09", "xref C=G\nno update",                {},                       ["xref_C_G"]),
+        # Row 4 – xref /C + update()
+        ("V10", "xref C=Y\n+ update()",               {},                       ["xref_C_Y", "update"]),
+        ("V11", "xref C=R\n+ update()",               {},                       ["xref_C_R", "update"]),
+        ("V12", "xref C=G\n+ update()",               {},                       ["xref_C_G", "update"]),
+        # Row 5 – xref /C + update() variants
+        ("V13", "xref C=Y\n+upd(fill=K)",             {},                       ["xref_C_Y", "upd_fill_K"]),
         ("V14", "xref C=Y\n+xref IC=K+upd",          {},                       ["xref_C_Y", "xref_IC_K", "update"]),
         ("V15", "fill=BLUE\nxref C=Y+upd",           {"fill_color": (0, 0, 1)}, ["xref_C_Y", "update"]),
     ]
@@ -693,10 +693,10 @@ def _diag_callout_variants(page: fitz.Page) -> None:
                 annot.update(fill_color=(1, 1, 0))
             elif action == "upd_tc_Y":
                 annot.update(text_color=(1, 1, 0))
-            elif action == "sc_stroke_Y":
-                annot.set_colors(stroke=(1, 1, 0))
             elif action == "xref_C_Y":
                 doc.xref_set_key(annot.xref, "C", "[1 1 0]")
+            elif action == "xref_C_R":
+                doc.xref_set_key(annot.xref, "C", "[1 0 0]")
             elif action == "xref_C_G":
                 doc.xref_set_key(annot.xref, "C", "[0 1 0]")
             elif action == "xref_IC_K":
