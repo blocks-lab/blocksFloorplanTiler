@@ -566,30 +566,39 @@ def place_callout_annotation(
 
     # ── Add the native PDF Callout FreeText annotation ────────────────────────
     # Requires PyMuPDF >= 1.25.3 (FreeTextCallout subtype added in that version)
+    #
+    # Confirmed by diagnostic grid (V04): text_color in the constructor controls
+    # the /DA appearance stream, which PyMuPDF uses for text, box border AND the
+    # callout arrow line — all three share the same color.  border_color and
+    # set_colors() both raise ValueError for FreeText in this PyMuPDF build.
+    # xref_set_key("C") + update() changes the BOX FILL, not the line color.
+    # Conclusion: text_color is the single lever for arrow + border color.
     annot = page.add_freetext_annot(
         best_rect,
         text,
         fontsize=font_size,
         fontname="helv",
-        fill_color=(0, 0, 0),        # black background  → PDF /IC key
-        text_color=(1, 1, 1),        # white text        → /DA appearance string
+        fill_color=(0, 0, 0),        # black box background
+        text_color=(1, 1, 0),        # yellow → controls text, box border AND arrow line
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
-    # Set callout line + box border color to yellow by writing the PDF /C key directly.
-    # update(border_color=...) only changes /DA (text color) — same as text_color —
-    # it never touches /C.  xref_set_key is the only reliable path to /C for FreeText.
-    # The subsequent update() call (no color args) rebuilds the /AP stream reading /C.
-    page.parent.xref_set_key(annot.xref, "C", "[1 1 0]")
-    annot.update()
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DIAGNOSTIC: 15-variant FreeText callout grid
+# DIAGNOSTIC RETIRED — findings summary:
+#   text_color = controls text color, box border stroke AND arrow line (all one color)
+#   fill_color = controls box background fill
+#   border_color / set_colors() = raise ValueError for FreeText in this build
+#   xref_set_key("C") + update() = changes BOX FILL to /C value (not line color)
+# Production fix: text_color=(1,1,0) [yellow] in constructor gives black box +
+#   yellow text + yellow arrow + yellow border. No post-update needed.
+# ──────────────────────────────────────────────────────────────────────────────
+# DIAGNOSTIC: 15-variant FreeText callout grid (retired – kept for reference)
 # Renders once per export in the top-left corner to identify which API
 # combination actually produces a coloured callout border/line.
 #
@@ -620,7 +629,7 @@ def place_callout_annotation(
 #     V14  xref C=yellow + xref IC=black + update()
 #     V15  ctor fill=blue + xref C=yellow + update()
 # ──────────────────────────────────────────────────────────────────────────────
-def _diag_callout_variants(page: fitz.Page) -> None:
+def _diag_callout_variants_RETIRED(page: fitz.Page) -> None:
     """Render 15 FreeText callout annotation variants at top-left of page."""
     BOX_W, BOX_H = 120, 45
     COLS = 3
@@ -742,10 +751,6 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]  # First page
-
-    # Static diagnostic grid – identifies which API combination colours the callout
-    # line/border. Remove this call once the correct approach is confirmed.
-    _diag_callout_variants(page)
 
     logging.info(f"=" * 80)
     logging.info(f"PDF ANNOTATION")
