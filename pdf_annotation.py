@@ -30,8 +30,8 @@ ANNOTATION_CONFIG = {
         "stroke_opacity": 0.0
     },
     "marker": {
-        "fill_color": (1, 0, 0),
-        "fill_opacity": 1.0,
+        "fill_color": (1, 1, 0),
+        "fill_opacity": 0.8,
         "radius": 10,
         "stroke_color": (0, 0, 0),
         "stroke_width": 2
@@ -237,7 +237,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                 ((p.x - cx) ** 2 + (p.y - cy) ** 2) ** 0.5
                 for p in pdf_points
             )
-            pending_callouts.append((cx, cy, circumradius, overlay))
+            pending_callouts.append((cx, cy, circumradius, overlay, pdf_points))
             logging.info(f"   Polygon overlay queued: centroid=({cx:.1f},{cy:.1f}), circumradius={circumradius:.1f}")
     else:
         logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
@@ -273,30 +273,30 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
     radius = config["radius"]
 
-    # Draw circle burned into content stream (proven working approach)
-    shape = page.new_shape()
-    shape.draw_circle(fitz.Point(x_pdf, y_pdf), radius)
-    shape.finish(
-        fill=config["fill_color"],
-        color=config.get("stroke_color", config["fill_color"]),
-        width=config.get("stroke_width", 1),
-        fill_opacity=config["fill_opacity"]
+    # Native PDF Circle annotation — selectable/movable in Acrobat
+    stroke_color = config.get("stroke_color", (0, 0, 0))
+    circ_rect = fitz.Rect(
+        x_pdf - radius, y_pdf - radius,
+        x_pdf + radius, y_pdf + radius
     )
-    shape.commit()
-    logging.info(f"✅ Marker drawn at ({x_pdf:.1f}, {y_pdf:.1f})")
+    circ_annot = page.add_circle_annot(circ_rect)
+    circ_annot.set_colors(stroke=stroke_color, fill=config["fill_color"])
+    circ_annot.set_border(width=config.get("stroke_width", 2))
+    circ_annot.update(opacity=config["fill_opacity"])
+    logging.info(f"✅ Marker circle annotation placed at ({x_pdf:.1f}, {y_pdf:.1f})")
 
-    # Overlay → deferred Callout annotation (placed after all shapes)
-    if overlay:
-        if pending_callouts is not None:
+    # Both label and overlay become separate Callout annotations, each with
+    # their own arrow pointing at the marker centre.
+    if pending_callouts is not None:
+        if label:
+            pending_callouts.append((x_pdf, y_pdf, radius, label))
+            logging.info(f"   Label queued for callout: '{label}'")
+        if overlay:
             pending_callouts.append((x_pdf, y_pdf, radius, overlay))
             logging.info(f"   Overlay queued for callout: '{overlay}'")
-        else:
-            logging.warning(f"   overlay='{overlay}' but no pending_callouts list provided — skipped")
-
-    # Draw label below if provided (burned in)
-    if label:
-        text_config = ANNOTATION_CONFIG["text"]
-        draw_text_on_pdf(page, [x_pdf, y_pdf + radius + 5], label, text_config)
+    else:
+        if label or overlay:
+            logging.warning("   label/overlay present but no pending_callouts list provided — skipped")
 
 
 def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
@@ -362,6 +362,39 @@ def draw_text_on_pdf(page: fitz.Page, position: List[float],
     )
 
 
+def _closest_point_on_polygon(query: fitz.Point, pts: List[fitz.Point]) -> fitz.Point:
+    """
+    Return the closest point on a polygon's perimeter to `query`.
+
+    Iterates every edge of the outer ring using the perpendicular-foot formula,
+    clamped to the segment endpoints.  Deduplicates the GeoJSON closing vertex
+    (where pts[0] == pts[-1]) before iterating so there is no zero-length edge.
+    """
+    # Remove duplicate GeoJSON closing vertex
+    ring = pts
+    if len(ring) > 1 and ring[0].x == ring[-1].x and ring[0].y == ring[-1].y:
+        ring = ring[:-1]
+
+    best_pt = ring[0]
+    best_d2 = float("inf")
+    n = len(ring)
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        dx, dy = b.x - a.x, b.y - a.y
+        len2 = dx * dx + dy * dy
+        if len2 == 0.0:
+            cp = a
+        else:
+            t = max(0.0, min(1.0, ((query.x - a.x) * dx + (query.y - a.y) * dy) / len2))
+            cp = fitz.Point(a.x + t * dx, a.y + t * dy)
+        d2 = (cp.x - query.x) ** 2 + (cp.y - query.y) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best_pt = cp
+    return best_pt
+
+
 def place_callout_annotation(
         page: fitz.Page,
         marker_x: float,
@@ -371,25 +404,36 @@ def place_callout_annotation(
         placed_boxes: List[fitz.Rect],
         font_size: float = 9.0,
         box_width: float = 130.0,
-        gap: float = 15.0) -> None:
+        gap: float = 15.0,
+        polygon_points: List[fitz.Point] = None) -> None:
     """
-    Add a Callout FreeText annotation whose arrow tip points at the marker center.
+    Add a Callout FreeText annotation.
 
-    The text box is placed outside the marker with a minimum gap equal to
+    For markers the arrow tip is the marker centre.  For polygons, after the
+    text box position is decided, the tip is snapped to the closest point on
+    the polygon's perimeter to the box-border attach point — so the arrow
+    always touches the polygon edge rather than piercing through the fill.
+
+    The text box is placed outside the shape with a minimum gap equal to
     marker_radius + gap points.  Eight candidate directions are tried in order;
     the position with the least overlap against already-placed callout boxes is
     chosen (zero-overlap preferred).  The chosen rect is appended to
     placed_boxes so subsequent calls avoid it.
 
     Args:
-        page:           PyMuPDF page object.
-        marker_x/y:     Marker center in PDF points (top-left origin, Y down).
-        marker_radius:  Radius of the burned-in marker circle.
-        text:           Text to display in the callout box.
-        placed_boxes:   Mutable list of already-placed Rect objects (modified in-place).
-        font_size:      Font size for the callout text.
-        box_width:      Fixed width for the text box in points.
-        gap:            Minimum clearance between marker edge and box edge.
+        page:            PyMuPDF page object.
+        marker_x/y:      Anchor point in PDF points used for box placement
+                         (marker centre or polygon centroid).
+        marker_radius:   Exclusion radius around the anchor (circle radius for
+                         markers, circumradius for polygons).
+        text:            Text to display in the callout box.
+        placed_boxes:    Mutable list of already-placed Rect objects.
+        font_size:       Font size for the callout text.
+        box_width:       Fixed width for the text box in points.
+        gap:             Minimum clearance beyond marker_radius to box edge.
+        polygon_points:  If provided, the arrow tip is snapped to the closest
+                         point on this polygon's outer-ring perimeter instead
+                         of the anchor point.  Pass None for circular markers.
     """
     page_rect = page.rect
 
@@ -495,7 +539,14 @@ def place_callout_annotation(
         ay = (cy0 + cy1) / 2  # same row → vertical centre
 
     attach = fitz.Point(ax, ay)
-    tip    = fitz.Point(marker_x, marker_y)
+
+    # For polygons: snap the tip to the closest point on the perimeter so the
+    # arrow touches the polygon edge rather than pointing at the interior.
+    # For markers: use the marker centre as before.
+    if polygon_points:
+        tip = _closest_point_on_polygon(attach, polygon_points)
+    else:
+        tip = fitz.Point(marker_x, marker_y)
 
     # ── Add the native PDF Callout FreeText annotation ────────────────────────
     # Requires PyMuPDF >= 1.25.3 (FreeTextCallout subtype added in that version)
@@ -506,6 +557,7 @@ def place_callout_annotation(
         fontname="helv",
         fill_color=(0, 0, 0),        # black background
         text_color=(1, 1, 1),        # white text
+        rect_color=(1, 1, 0),        # yellow leader line + box border
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
@@ -579,11 +631,6 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             if geo_type == "Polygon":
                 config = ANNOTATION_CONFIG["polygon"].copy()
-                # Apply transparent property if present
-                transparent = obj.get("properties", {}).get("transparent") is True
-                if transparent:
-                    config["fill_opacity"] = 0
-                    logging.info(f"   transparent=True — fill will be invisible")
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
                 logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts)
@@ -591,8 +638,6 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             elif geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"].copy()
-                if obj.get("properties", {}).get("transparent") is True:
-                    config["fill_opacity"] = 0
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
                 draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts)
@@ -611,9 +656,11 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     if pending_callouts:
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
         placed_boxes: List[fitz.Rect] = []
-        for (cx, cy, r, callout_text) in pending_callouts:
+        for item in pending_callouts:
+            cx, cy, r, callout_text = item[:4]
+            poly_pts = item[4] if len(item) > 4 else None
             try:
-                place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes)
+                place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts)
             except Exception as e:
                 logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
 
