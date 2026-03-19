@@ -579,10 +579,10 @@ def place_callout_annotation(
         fontsize=font_size,
         fontname="helv",
         fill_color=(0, 0, 0),        # black box background
-        text_color=(1, 1, 0),        # yellow → controls text, box border AND arrow line
+        text_color=(0, 0, 0.6),      # dark blue → controls text, box border AND arrow line
         border_width=2.5,
         callout=[tip, attach],
-        line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
+        line_end=fitz.PDF_ANNOT_LE_NONE,
     )
 
     placed_boxes.append(best_rect)
