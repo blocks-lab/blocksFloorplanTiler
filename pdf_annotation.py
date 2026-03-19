@@ -217,6 +217,21 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         shape.finish(fill=(0, 0, 1), color=(0, 0, 0), width=2, fill_opacity=1.0)
         shape.commit()
         logging.info(f"✅ DEBUG polygon centroid circle at ({centroid_x:.1f}, {centroid_y:.1f})")
+
+        # Draw the actual polygon using draw_polyline + closePath=True
+        # (Shape.draw_polygon does not exist in PyMuPDF 1.23.x)
+        shape = page.new_shape()
+        shape.draw_polyline(pdf_points)
+        shape.finish(
+            fill=config["fill_color"],
+            color=config["stroke_color"],
+            width=config["stroke_width"],
+            fill_opacity=config["fill_opacity"],
+            stroke_opacity=config.get("stroke_opacity", 1.0),
+            closePath=True
+        )
+        shape.commit()
+        logging.info(f"✅ Polygon drawn with {len(pdf_points)} points")
     else:
         logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
 
