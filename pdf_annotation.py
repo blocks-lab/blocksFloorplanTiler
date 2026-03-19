@@ -691,6 +691,80 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
+    # ── DIAGNOSTIC: render a grid of FreeText variants to find what works ────
+    # Each row tries one combination of fill_color / text_color / border_color
+    # and whether update() is called and with what args.
+    # The label burned into the page (insert_text) names each variant so it's
+    # legible even if the annotation itself is invisible.
+    _diag_tip   = fitz.Point(30, 40)   # arrow tip  (fixed, top-left area)
+    _row_h      = 60                    # vertical spacing between variants
+    _col_x      = 60                    # left edge of text boxes
+    _w, _h      = 160, 30              # box dimensions
+    _variants = [
+        # (id, fill_color,   text_color,  border_color, call_update, update_kwargs)
+        ( 1,  (0,0,0),      (1,1,1),     None,          False, {}),                          # 1: black fill, white text, no border_color, no update
+        ( 2,  (0,0,0),      (1,1,1),     None,          True,  {}),                          # 2: same + update()
+        ( 3,  (0,0,0),      (1,1,1),     None,          True,  {"border_color":(1,1,0)}),    # 3: update(border_color=yellow)
+        ( 4,  (0,0,0),      (1,1,1),     None,          True,  {"text_color":(1,1,0)}),      # 4: update(text_color=yellow)
+        ( 5,  (0,0,0),      (1,1,1),     (1,1,0),       False, {}),                          # 5: border_color in ctor, no update
+        ( 6,  (0,0,0),      (1,1,1),     (1,1,0),       True,  {}),                          # 6: border_color in ctor + update()
+        ( 7,  (0,0,0),      (1,1,1),     (1,0,0),       False, {}),                          # 7: border_color=red in ctor, no update
+        ( 8,  (0,0,0),      (1,1,1),     (1,0,0),       True,  {}),                          # 8: border_color=red in ctor + update()
+        ( 9,  (0,0,0),      (1,0,0),     None,          False, {}),                          # 9: text_color=red in ctor, no update
+        (10,  (0,0,0),      (1,0,0),     None,          True,  {}),                          # 10: text_color=red + update()
+        (11,  (1,1,1),      (0,0,0),     (1,1,0),       False, {}),                          # 11: white fill, black text, yellow border, no update
+        (12,  (1,1,1),      (0,0,0),     (1,1,0),       True,  {}),                          # 12: white fill, black text, yellow border + update()
+        (13,  None,         (0,0,0),     None,           False, {}),                          # 13: no fill (transparent), black text
+        (14,  None,         (0,0,0),     (1,1,0),        False, {}),                          # 14: no fill, yellow border
+        (15,  (0,0,0),      (1,1,1),     None,           True,  {"fill_color":(0,0,0)}),     # 15: update(fill_color=black) to force AP rebuild
+    ]
+
+    pw = page.rect.width
+    ph = page.rect.height
+
+    for vid, fill_c, text_c, border_c, do_update, upd_kw in _variants:
+        by0 = 20 + (vid - 1) * _row_h
+        if by0 + _h > ph - 10:
+            break  # stop if page runs out
+
+        bx0 = _col_x
+        rect = fitz.Rect(bx0, by0, bx0 + _w, by0 + _h)
+        tip  = fitz.Point(bx0 - 20, by0 + _h / 2)
+        attach = fitz.Point(bx0, by0 + _h / 2)
+        label = f"#{vid}: fill={fill_c} text={text_c} border={border_c} upd={do_update} {upd_kw if upd_kw else ''}"
+
+        # Burn the label as plain text so it's always visible
+        page.insert_text(
+            fitz.Point(bx0 + _w + 8, by0 + _h / 2 + 4),
+            label,
+            fontsize=6,
+            color=(0, 0, 0),
+        )
+
+        # Build constructor kwargs — only pass args that are not None
+        ctor_kw = dict(
+            fontsize=8,
+            fontname="helv",
+            border_width=1.5,
+            callout=[tip, attach],
+            line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
+        )
+        if fill_c is not None:
+            ctor_kw["fill_color"] = fill_c
+        if text_c is not None:
+            ctor_kw["text_color"] = text_c
+        if border_c is not None:
+            ctor_kw["border_color"] = border_c
+
+        try:
+            annot = page.add_freetext_annot(rect, f"ID#{vid} Hello World", **ctor_kw)
+            if do_update:
+                annot.update(**upd_kw)
+            logging.info(f"Diag variant #{vid} placed OK")
+        except Exception as e:
+            logging.warning(f"Diag variant #{vid} FAILED: {e}")
+    # ── END DIAGNOSTIC ────────────────────────────────────────────────────────
+
     # Save to bytes
     output = io.BytesIO()
     doc.save(output)
