@@ -485,11 +485,10 @@ def place_callout_annotation(
         best_rect,
         text,
         fontsize=font_size,
-        fontname="Helvetica",
+        fontname="helv",
         fill_color=(1, 1, 0),        # yellow background — easy to spot in testing
         border_color=(0, 0, 0),
         text_color=(0, 0, 0),        # black text
-        callout=[attach, tip]
     )
     annot.set_border(width=1.5)
     annot.update()
