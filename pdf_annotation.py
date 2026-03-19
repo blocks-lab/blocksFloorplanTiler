@@ -31,10 +31,10 @@ ANNOTATION_CONFIG = {
     },
     "marker": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.2,
-        "radius": 4,
+        "fill_opacity": 0.8,
+        "radius": 8,
         "stroke_color": (0, 0, 0),
-        "stroke_width": 1
+        "stroke_width": 5
     },
     "square": {
         "fill_color": (1, 0, 0),
