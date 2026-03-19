@@ -572,13 +572,14 @@ def place_callout_annotation(
         fontsize=font_size,
         fontname="helv",
         fill_color=(0, 0, 0),        # black background
-        text_color=(1, 1, 1),        # white text
-        border_color=(1, 1, 0),      # yellow callout line + box border (PDF /C key)
+        text_color=(1, 1, 1),        # white text (sets /DA appearance stream)
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
-    annot.update()
+    # border_color in update() sets the PDF /C key (callout line + box border stroke)
+    # separately from the /DA appearance stream text color set in the constructor above.
+    annot.update(border_color=(1, 1, 0))
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
