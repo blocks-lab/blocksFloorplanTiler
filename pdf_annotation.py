@@ -566,27 +566,144 @@ def place_callout_annotation(
 
     # ── Add the native PDF Callout FreeText annotation ────────────────────────
     # Requires PyMuPDF >= 1.25.3 (FreeTextCallout subtype added in that version)
-    #
-    # Color semantics for FreeText in PyMuPDF (confirmed from fitz.i source + runtime):
-    #   fill_color   → fills the text box background  (AP stream fcol)
-    #   text_color   → text rendering color            (/DA string)
-    #   border_color → stroke color for callout line, arrowhead, and box border (AP stream bcol)
-    #   /C PDF key   → also maps to fill (DO NOT touch via xref_set_key — it overrides fill_color)
     annot = page.add_freetext_annot(
         best_rect,
         text,
         fontsize=font_size,
         fontname="helv",
-        fill_color=(0, 0, 0),        # black background
-        text_color=(1, 1, 1),        # white text
-        border_color=(1, 1, 0),      # yellow callout line, arrowhead, and box border
+        fill_color=(0, 0, 0),        # black background  → PDF /IC key
+        text_color=(1, 1, 1),        # white text        → /DA appearance string
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
+    # Set callout line + box border color to yellow by writing the PDF /C key directly.
+    # update(border_color=...) only changes /DA (text color) — same as text_color —
+    # it never touches /C.  xref_set_key is the only reliable path to /C for FreeText.
+    # The subsequent update() call (no color args) rebuilds the /AP stream reading /C.
+    page.parent.xref_set_key(annot.xref, "C", "[1 1 0]")
+    annot.update()
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DIAGNOSTIC: 15-variant FreeText callout grid
+# Renders once per export in the top-left corner to identify which API
+# combination actually produces a coloured callout border/line.
+#
+# Layout:  3 columns × 5 rows  (origin 10, 10)
+#   Box:   120 × 45 pt
+#   Tip:   35 pt right + 13 pt below box right-centre  (angled arrow)
+#   Cell:  170 × 65 pt  →  total footprint ≈ 510 × 325 pt
+#
+# Variant index (V01–V15) → configuration:
+#   Row 1 – constructor params only
+#     V01  baseline: fill=black, text=white, no color mutation
+#     V02  ctor border_color=(1,1,0)
+#     V03  ctor border_color=(1,1,0) + update()
+#   Row 2 – update() method
+#     V04  update(border_color=(1,1,0))
+#     V05  update(text_color=(1,1,0))  [docs: same effect as border_color]
+#     V06  update(border_color=(1,1,0), text_color=(1,1,0))
+#   Row 3 – set_colors()
+#     V07  set_colors(stroke=(1,1,0))   — no update
+#     V08  set_colors(stroke=(1,1,0)) + update()
+#     V09  set_colors(stroke=(1,1,0)) + update(fill_color=(0,0,0))
+#   Row 4 – xref_set_key direct PDF dict
+#     V10  xref "C"="[1 1 0]"   — no update
+#     V11  xref "C"="[1 1 0]" + update()          ← current production fix
+#     V12  xref "C"="[1 1 0]" + update(fill_color=(0,0,0))
+#   Row 5 – combined / edge cases
+#     V13  set_colors(Y) → xref C=[0 1 0] (green) + update()  [who wins?]
+#     V14  ctor border_color=(1,1,0) + xref C=[1 1 0] + update()
+#     V15  fill=(0,0,1) [blue box] + xref C=[1 1 0] + update()
+# ──────────────────────────────────────────────────────────────────────────────
+def _diag_callout_variants(page: fitz.Page) -> None:
+    """Render 15 FreeText callout annotation variants at top-left of page."""
+    BOX_W, BOX_H = 120, 45
+    COLS = 3
+    H_CELL = 170   # 120 box + 35 arrow + 15 gap
+    V_CELL = 65    # 45 box + 20 row-gap
+    OX, OY = 10, 10
+
+    doc = page.parent
+
+    # (id, description, ctor_extra_kwargs, post_actions)
+    # post_actions are string tokens processed in order below.
+    VARIANTS = [
+        # Row 1 – constructor-param variants
+        ("V01", "baseline\n(no color args)",        {},                                []),
+        ("V02", "ctor\nborder_color=Y",              {"border_color": (1, 1, 0)},       []),
+        ("V03", "ctor bc=Y\n+ update()",             {"border_color": (1, 1, 0)},       ["update"]),
+        # Row 2 – update() method
+        ("V04", "update(\nborder_color=Y)",          {},                                ["upd_bc_Y"]),
+        ("V05", "update(\ntext_color=Y)",            {},                                ["upd_tc_Y"]),
+        ("V06", "update(bc=Y\n+ tc=Y)",              {},                                ["upd_bc_Y", "upd_tc_Y"]),
+        # Row 3 – set_colors()
+        ("V07", "set_colors(Y)\nno update",          {},                                ["sc_stroke_Y"]),
+        ("V08", "set_colors(Y)\n+ update()",         {},                                ["sc_stroke_Y", "update"]),
+        ("V09", "set_colors(Y)\n+ upd(fill=K)",      {},                                ["sc_stroke_Y", "upd_fill_K"]),
+        # Row 4 – xref_set_key direct PDF dict
+        ("V10", "xref C=Y\nno update",               {},                                ["xref_C_Y"]),
+        ("V11", "xref C=Y\n+ update()",              {},                                ["xref_C_Y", "update"]),
+        ("V12", "xref C=Y\n+ upd(fill=K)",           {},                                ["xref_C_Y", "upd_fill_K"]),
+        # Row 5 – combined / edge cases
+        ("V13", "sc(Y)+xref C=G\n+ upd (green?)",   {},                                ["sc_stroke_Y", "xref_C_G", "update"]),
+        ("V14", "ctor bc=Y\n+xref C=Y+upd",         {"border_color": (1, 1, 0)},       ["xref_C_Y", "update"]),
+        ("V15", "fill=BLUE\nxref C=Y+upd",           {"fill_color": (0, 0, 1)},         ["xref_C_Y", "update"]),
+    ]
+
+    shape = page.new_shape()
+    for idx, (vid, desc, ctor_extra, post_actions) in enumerate(VARIANTS):
+        col = idx % COLS
+        row = idx // COLS
+        x0 = OX + col * H_CELL
+        y0 = OY + row * V_CELL
+        rect = fitz.Rect(x0, y0, x0 + BOX_W, y0 + BOX_H)
+        attach = fitz.Point(x0 + BOX_W, y0 + BOX_H / 2)
+        tip    = fitz.Point(x0 + BOX_W + 35, y0 + BOX_H / 2 + 13)
+
+        # Build constructor kwargs – defaults then variant overrides
+        ctor_kw: dict = {
+            "fontsize":    7,
+            "fontname":    "helv",
+            "fill_color":  (0, 0, 0),   # default: black box
+            "text_color":  (1, 1, 1),   # default: white text
+            "border_width": 1.5,
+            "callout":     [tip, attach],
+            "line_end":    fitz.PDF_ANNOT_LE_OPEN_ARROW,
+        }
+        # Apply variant ctor overrides (these may replace fill_color / text_color)
+        ctor_kw.update(ctor_extra)
+
+        label = f"{vid}\n{desc}"
+        annot = page.add_freetext_annot(rect, label, **ctor_kw)
+
+        # Post-creation mutations
+        for action in post_actions:
+            if action == "update":
+                annot.update()
+            elif action == "upd_fill_K":
+                annot.update(fill_color=(0, 0, 0))
+            elif action == "upd_bc_Y":
+                annot.update(border_color=(1, 1, 0))
+            elif action == "upd_tc_Y":
+                annot.update(text_color=(1, 1, 0))
+            elif action == "sc_stroke_Y":
+                annot.set_colors(stroke=(1, 1, 0))
+            elif action == "xref_C_Y":
+                doc.xref_set_key(annot.xref, "C", "[1 1 0]")
+            elif action == "xref_C_G":
+                doc.xref_set_key(annot.xref, "C", "[0 1 0]")
+
+        # Small dot at the tip so we can see the target even if arrow is invisible
+        shape.draw_circle(tip, 3)
+        shape.finish(color=(0, 0, 0), fill=(1, 1, 0), width=0.5)
+
+    shape.commit()
+    logging.info(f"🧪 DIAG: rendered {len(VARIANTS)} callout variants at top-left")
 
 
 async def download_file(url: str) -> bytes:
@@ -621,6 +738,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]  # First page
+
+    # Static diagnostic grid – identifies which API combination colours the callout
+    # line/border. Remove this call once the correct approach is confirmed.
+    _diag_callout_variants(page)
 
     logging.info(f"=" * 80)
     logging.info(f"PDF ANNOTATION")
@@ -690,80 +811,6 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"\n{'=' * 80}")
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
-
-    # ── DIAGNOSTIC: render a grid of FreeText variants to find what works ────
-    # Each row tries one combination of fill_color / text_color / border_color
-    # and whether update() is called and with what args.
-    # The label burned into the page (insert_text) names each variant so it's
-    # legible even if the annotation itself is invisible.
-    _diag_tip   = fitz.Point(30, 40)   # arrow tip  (fixed, top-left area)
-    _row_h      = 60                    # vertical spacing between variants
-    _col_x      = 60                    # left edge of text boxes
-    _w, _h      = 160, 30              # box dimensions
-    _variants = [
-        # (id, fill_color,   text_color,  border_color, call_update, update_kwargs)
-        ( 1,  (0,0,0),      (1,1,1),     None,          False, {}),                          # 1: black fill, white text, no border_color, no update
-        ( 2,  (0,0,0),      (1,1,1),     None,          True,  {}),                          # 2: same + update()
-        ( 3,  (0,0,0),      (1,1,1),     None,          True,  {"border_color":(1,1,0)}),    # 3: update(border_color=yellow)
-        ( 4,  (0,0,0),      (1,1,1),     None,          True,  {"text_color":(1,1,0)}),      # 4: update(text_color=yellow)
-        ( 5,  (0,0,0),      (1,1,1),     (1,1,0),       False, {}),                          # 5: border_color in ctor, no update
-        ( 6,  (0,0,0),      (1,1,1),     (1,1,0),       True,  {}),                          # 6: border_color in ctor + update()
-        ( 7,  (0,0,0),      (1,1,1),     (1,0,0),       False, {}),                          # 7: border_color=red in ctor, no update
-        ( 8,  (0,0,0),      (1,1,1),     (1,0,0),       True,  {}),                          # 8: border_color=red in ctor + update()
-        ( 9,  (0,0,0),      (1,0,0),     None,          False, {}),                          # 9: text_color=red in ctor, no update
-        (10,  (0,0,0),      (1,0,0),     None,          True,  {}),                          # 10: text_color=red + update()
-        (11,  (1,1,1),      (0,0,0),     (1,1,0),       False, {}),                          # 11: white fill, black text, yellow border, no update
-        (12,  (1,1,1),      (0,0,0),     (1,1,0),       True,  {}),                          # 12: white fill, black text, yellow border + update()
-        (13,  None,         (0,0,0),     None,           False, {}),                          # 13: no fill (transparent), black text
-        (14,  None,         (0,0,0),     (1,1,0),        False, {}),                          # 14: no fill, yellow border
-        (15,  (0,0,0),      (1,1,1),     None,           True,  {"fill_color":(0,0,0)}),     # 15: update(fill_color=black) to force AP rebuild
-    ]
-
-    pw = page.rect.width
-    ph = page.rect.height
-
-    for vid, fill_c, text_c, border_c, do_update, upd_kw in _variants:
-        by0 = 20 + (vid - 1) * _row_h
-        if by0 + _h > ph - 10:
-            break  # stop if page runs out
-
-        bx0 = _col_x
-        rect = fitz.Rect(bx0, by0, bx0 + _w, by0 + _h)
-        tip  = fitz.Point(bx0 - 20, by0 + _h / 2)
-        attach = fitz.Point(bx0, by0 + _h / 2)
-        label = f"#{vid}: fill={fill_c} text={text_c} border={border_c} upd={do_update} {upd_kw if upd_kw else ''}"
-
-        # Burn the label as plain text so it's always visible
-        page.insert_text(
-            fitz.Point(bx0 + _w + 8, by0 + _h / 2 + 4),
-            label,
-            fontsize=6,
-            color=(0, 0, 0),
-        )
-
-        # Build constructor kwargs — only pass args that are not None
-        ctor_kw = dict(
-            fontsize=8,
-            fontname="helv",
-            border_width=1.5,
-            callout=[tip, attach],
-            line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
-        )
-        if fill_c is not None:
-            ctor_kw["fill_color"] = fill_c
-        if text_c is not None:
-            ctor_kw["text_color"] = text_c
-        if border_c is not None:
-            ctor_kw["border_color"] = border_c
-
-        try:
-            annot = page.add_freetext_annot(rect, f"ID#{vid} Hello World", **ctor_kw)
-            if do_update:
-                annot.update(**upd_kw)
-            logging.info(f"Diag variant #{vid} placed OK")
-        except Exception as e:
-            logging.warning(f"Diag variant #{vid} FAILED: {e}")
-    # ── END DIAGNOSTIC ────────────────────────────────────────────────────────
 
     # Save to bytes
     output = io.BytesIO()
