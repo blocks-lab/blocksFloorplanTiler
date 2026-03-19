@@ -181,7 +181,8 @@ def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
 def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                        metadata: Dict[str, Any], config: Dict[str, Any],
                        overlay: str = None,
-                       trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
+                       trim_offset: Tuple[float, float] = (0.0, 0.0),
+                       pending_callouts: List = None) -> None:
     """
     Draw a filled polygon on the PDF page, optionally with centered overlay text.
 
@@ -192,6 +193,9 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         config: Styling configuration
         overlay: Optional text to display at the polygon's centroid
         trim_offset: (trim_left, trim_top) whitespace offset in pixels
+        pending_callouts: Mutable list; if an overlay is set, a
+            (cx, cy, circumradius, text) tuple is appended so the caller
+            can place the Callout annotation after all shapes are burned in.
     """
     # GeoJSON polygons: coordinates[0] is outer ring
     outer_ring = coordinates[0]
@@ -222,6 +226,19 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         )
         shape.commit()
         logging.info(f"✅ Polygon drawn with {len(pdf_points)} points")
+
+        # Queue a deferred callout whose arrow tip points at the polygon centroid.
+        # Use circumradius (max centroid→vertex distance) so the text box is
+        # placed beyond the polygon's outermost vertex in every direction.
+        if overlay and pending_callouts is not None:
+            cx = sum(p.x for p in pdf_points) / len(pdf_points)
+            cy = sum(p.y for p in pdf_points) / len(pdf_points)
+            circumradius = max(
+                ((p.x - cx) ** 2 + (p.y - cy) ** 2) ** 0.5
+                for p in pdf_points
+            )
+            pending_callouts.append((cx, cy, circumradius, overlay))
+            logging.info(f"   Polygon overlay queued: centroid=({cx:.1f},{cy:.1f}), circumradius={circumradius:.1f}")
     else:
         logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
 
@@ -489,7 +506,8 @@ def place_callout_annotation(
         fontname="helv",
         fill_color=(0, 0, 0),        # black background
         text_color=(1, 1, 1),        # white text
-        border_width=1.5,
+        color=(0, 0, 0),             # black leader line + box border
+        border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
@@ -569,7 +587,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                     logging.info(f"   transparent=True — fill will be invisible")
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
                 logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}")
-                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
+                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts)
                 objects_drawn += 1
 
             elif geo_type == "Point":
