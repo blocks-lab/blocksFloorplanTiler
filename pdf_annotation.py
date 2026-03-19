@@ -531,7 +531,16 @@ def place_callout_annotation(
         callout=[attach, tip]        # 2-point leader: box edge → marker centre
     )
     annot.set_border(width=0.75)
-    annot.update()
+    # Colors must also be passed to update() — calling update() without them
+    # regenerates the appearance stream from viewer defaults, discarding the
+    # colors set at creation time.
+    annot.update(
+        fontsize=font_size,
+        fontname="Helvetica",
+        fill_color=(0, 0, 0),
+        border_color=(0, 0, 0),
+        text_color=(1, 1, 1),
+    )
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
