@@ -557,11 +557,11 @@ def place_callout_annotation(
         fontname="helv",
         fill_color=(0, 0, 0),        # black background
         text_color=(1, 1, 1),        # white text
-        rect_color=(1, 1, 0),        # yellow leader line + box border
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
+    annot.set_colors(stroke=(1, 1, 0))   # yellow leader line + box border
     annot.update()
 
     placed_boxes.append(best_rect)
