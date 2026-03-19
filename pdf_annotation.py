@@ -295,17 +295,17 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
     radius = config["radius"]
 
-    # Draw circle (burned in — not selectable)
-    shape = page.new_shape()
-    shape.draw_circle(fitz.Point(x_pdf, y_pdf), radius)
-    shape.finish(
-        fill=config["fill_color"],
-        color=config.get("stroke_color", config["fill_color"]),
-        width=config.get("stroke_width", 1),
-        fill_opacity=config["fill_opacity"]
+    # Draw circle as a native PDF annotation (selectable in Acrobat)
+    _marker_rect = fitz.Rect(x_pdf - radius, y_pdf - radius, x_pdf + radius, y_pdf + radius)
+    _marker_annot = page.add_circle_annot(_marker_rect)
+    _marker_annot.set_colors(
+        stroke=config.get("stroke_color", (0, 0, 0)),
+        fill=config["fill_color"]
     )
-    shape.commit()
-    logging.info(f"✅ Marker burned in at ({x_pdf:.1f}, {y_pdf:.1f})")
+    _marker_annot.set_opacity(config["fill_opacity"])
+    _marker_annot.set_border(width=config.get("stroke_width", 1))
+    _marker_annot.update()
+    logging.info(f"✅ Marker annotation at ({x_pdf:.1f}, {y_pdf:.1f})")
 
     # Overlay → deferred Callout annotation (placed after all shapes)
     if overlay:
