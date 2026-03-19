@@ -295,17 +295,17 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
     radius = config["radius"]
 
-    # Draw circle as a native PDF annotation (selectable in Acrobat)
-    _marker_rect = fitz.Rect(x_pdf - radius, y_pdf - radius, x_pdf + radius, y_pdf + radius)
-    _marker_annot = page.add_circle_annot(_marker_rect)
-    _marker_annot.set_colors(
-        stroke=config.get("stroke_color", (0, 0, 0)),
-        fill=config["fill_color"]
+    # Draw circle burned into content stream (proven working approach)
+    shape = page.new_shape()
+    shape.draw_circle(fitz.Point(x_pdf, y_pdf), radius)
+    shape.finish(
+        fill=config["fill_color"],
+        color=config.get("stroke_color", config["fill_color"]),
+        width=config.get("stroke_width", 1),
+        fill_opacity=config["fill_opacity"]
     )
-    _marker_annot.set_opacity(config["fill_opacity"])
-    _marker_annot.set_border(width=config.get("stroke_width", 1))
-    _marker_annot.update()
-    logging.info(f"✅ Marker annotation at ({x_pdf:.1f}, {y_pdf:.1f})")
+    shape.commit()
+    logging.info(f"✅ Marker drawn at ({x_pdf:.1f}, {y_pdf:.1f})")
 
     # Overlay → deferred Callout annotation (placed after all shapes)
     if overlay:
@@ -581,22 +581,6 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"PDF size: {page.rect.width:.2f} x {page.rect.height:.2f} points")
     logging.info(f"Image size: {metadata['source_image']['width']} x {metadata['source_image']['height']} pixels")
     logging.info(f"Objects to draw: {len(objects)}")
-
-    # ── DEBUG TEST SHAPE ─────────────────────────────────────────────────────
-    # Native circle annotation at the top-left corner — NOT burned in.
-    # Selectable, movable, deletable in Acrobat Reader.
-    # Remove once rendering is confirmed working.
-    _cx = page.rect.width * 0.05
-    _cy = page.rect.height * 0.05
-    _r = 20
-    _debug_rect = fitz.Rect(_cx - _r, _cy - _r, _cx + _r, _cy + _r)
-    _debug_annot = page.add_circle_annot(_debug_rect)
-    _debug_annot.set_colors(stroke=(0, 0, 0), fill=(0, 0, 1))
-    _debug_annot.set_opacity(1.0)
-    _debug_annot.set_border(width=2)
-    _debug_annot.update()
-    logging.info(f"🔵 DEBUG native circle annotation at ({_cx:.1f}, {_cy:.1f})")
-    # ── END DEBUG ─────────────────────────────────────────────────────────────
 
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
     trim_offset = detect_trim_offset(page, metadata)
