@@ -566,23 +566,24 @@ def place_callout_annotation(
 
     # ── Add the native PDF Callout FreeText annotation ────────────────────────
     # Requires PyMuPDF >= 1.25.3 (FreeTextCallout subtype added in that version)
+    #
+    # Color semantics for FreeText in PyMuPDF (confirmed from fitz.i source + runtime):
+    #   fill_color   → fills the text box background  (AP stream fcol)
+    #   text_color   → text rendering color            (/DA string)
+    #   border_color → stroke color for callout line, arrowhead, and box border (AP stream bcol)
+    #   /C PDF key   → also maps to fill (DO NOT touch via xref_set_key — it overrides fill_color)
     annot = page.add_freetext_annot(
         best_rect,
         text,
         fontsize=font_size,
         fontname="helv",
-        fill_color=(0, 0, 0),        # black background  → PDF /IC key
-        text_color=(1, 1, 1),        # white text        → /DA appearance string
+        fill_color=(0, 0, 0),        # black background
+        text_color=(1, 1, 1),        # white text
+        border_color=(1, 1, 0),      # yellow callout line, arrowhead, and box border
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
-    # Set callout line + box border color to yellow by writing the PDF /C key directly.
-    # update(border_color=...) only changes /DA (text color) — same as text_color —
-    # it never touches /C.  xref_set_key is the only reliable path to /C for FreeText.
-    # The subsequent update() call (no color args) rebuilds the /AP stream reading /C.
-    page.parent.xref_set_key(annot.xref, "C", "[1 1 0]")
-    annot.update()
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
