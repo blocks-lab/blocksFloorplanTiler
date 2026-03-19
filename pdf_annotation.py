@@ -182,7 +182,8 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                        metadata: Dict[str, Any], config: Dict[str, Any],
                        overlay: str = None,
                        trim_offset: Tuple[float, float] = (0.0, 0.0),
-                       pending_callouts: List = None) -> None:
+                       pending_callouts: List = None,
+                       shape_rects: List = None) -> None:
     """
     Draw a filled polygon on the PDF page, optionally with centered overlay text.
 
@@ -227,6 +228,12 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         shape.commit()
         logging.info(f"✅ Polygon drawn with {len(pdf_points)} points")
 
+        # Register bounding box so callout placement avoids the polygon fill.
+        if shape_rects is not None:
+            xs = [p.x for p in pdf_points]
+            ys = [p.y for p in pdf_points]
+            shape_rects.append(fitz.Rect(min(xs), min(ys), max(xs), max(ys)))
+
         # Queue a deferred callout whose arrow tip points at the polygon centroid.
         # Use circumradius (max centroid→vertex distance) so the text box is
         # placed beyond the polygon's outermost vertex in every direction.
@@ -248,7 +255,8 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
                        label: str = None,
                        overlay: str = None,
                        trim_offset: Tuple[float, float] = (0.0, 0.0),
-                       pending_callouts: List = None) -> None:
+                       pending_callouts: List = None,
+                       shape_rects: List = None) -> None:
     """
     Draw a circular marker (burned into content stream) on the PDF page.
 
@@ -284,6 +292,8 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     circ_annot.set_border(width=config.get("stroke_width", 2))
     circ_annot.update(opacity=config["fill_opacity"])
     logging.info(f"✅ Marker circle annotation placed at ({x_pdf:.1f}, {y_pdf:.1f})")
+    if shape_rects is not None:
+        shape_rects.append(circ_rect)
 
     # Both label and overlay become separate Callout annotations, each with
     # their own arrow pointing at the marker centre.
@@ -478,43 +488,49 @@ def place_callout_annotation(
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower overlap area = better
 
-    for dx, dy in DIRS:
-        # Position the box so its nearest edge is exactly min_dist from center
-        if dx > 0:
-            bx0 = marker_x + min_dist
-        elif dx < 0:
-            bx0 = marker_x - min_dist - box_width
-        else:
-            bx0 = marker_x - box_width / 2
+    # Try three expanding distance multipliers before giving up.
+    # Pushing boxes further out resolves crowded areas without moving the arrow tip.
+    for dist_mult in (1.0, 1.5, 2.0):
+        effective_dist = min_dist * dist_mult
 
-        if dy > 0:
-            by0 = marker_y + min_dist
-        elif dy < 0:
-            by0 = marker_y - min_dist - box_height
-        else:
-            by0 = marker_y - box_height / 2
+        for dx, dy in DIRS:
+            # Position the box so its nearest edge is exactly effective_dist from center
+            if dx > 0:
+                bx0 = marker_x + effective_dist
+            elif dx < 0:
+                bx0 = marker_x - effective_dist - box_width
+            else:
+                bx0 = marker_x - box_width / 2
 
-        candidate = fitz.Rect(bx0, by0, bx0 + box_width, by0 + box_height)
+            if dy > 0:
+                by0 = marker_y + effective_dist
+            elif dy < 0:
+                by0 = marker_y - effective_dist - box_height
+            else:
+                by0 = marker_y - box_height / 2
 
-        # Discard candidates that fall outside the page
-        if not page_rect.contains(candidate):
-            continue
+            candidate = fitz.Rect(bx0, by0, bx0 + box_width, by0 + box_height)
 
-        # Compute total overlap area with already-placed boxes
-        overlap = 0.0
-        for placed in placed_boxes:
-            inter = candidate & placed
-            if not inter.is_empty:
-                overlap += inter.width * inter.height
+            # Discard candidates that fall outside the page
+            if not page_rect.contains(candidate):
+                continue
 
-        if overlap < best_score:
-            best_score = overlap
-            best_rect = candidate
-            if overlap == 0.0:
-                break  # perfect fit found — stop early
+            # Compute total overlap area with already-placed boxes
+            overlap = 0.0
+            for placed in placed_boxes:
+                inter = candidate & placed
+                if not inter.is_empty:
+                    overlap += inter.width * inter.height
+
+            if overlap < best_score:
+                best_score = overlap
+                best_rect = candidate
+
+        if best_score == 0.0:
+            break  # perfect placement found — no need to try larger distances
 
     if best_rect is None:
-        # All 8 directions clipped by page bounds — place to the right and clamp
+        # All directions at all distances clipped by page bounds — clamp to right edge
         bx0 = min(marker_x + min_dist, page_rect.x1 - box_width)
         by0 = max(page_rect.y0, min(marker_y - box_height / 2, page_rect.y1 - box_height))
         best_rect = fitz.Rect(bx0, by0, bx0 + box_width, by0 + box_height)
@@ -557,11 +573,11 @@ def place_callout_annotation(
         fontname="helv",
         fill_color=(0, 0, 0),        # black background
         text_color=(1, 1, 1),        # white text
+        border_color=(1, 1, 0),      # yellow callout line + box border (PDF /C key)
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
-    annot.set_colors(stroke=(1, 1, 0))   # yellow leader line + box border
     annot.update()
 
     placed_boxes.append(best_rect)
@@ -618,6 +634,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # overlays.  Callout annotations are placed *after* all shapes are burned in
     # so the layout algorithm can avoid them properly.
     pending_callouts: List[Tuple[float, float, float, str]] = []
+    shape_rects: List[fitz.Rect] = []   # bounding rects of all burned shapes
     objects_drawn = 0
     for i, obj in enumerate(objects):
         try:
@@ -633,14 +650,14 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 config = ANNOTATION_CONFIG["polygon"].copy()
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
                 logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}")
-                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts)
+                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects)
                 objects_drawn += 1
 
             elif geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"].copy()
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
-                draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts)
+                draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts, shape_rects)
                 objects_drawn += 1
 
             else:
@@ -655,7 +672,8 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # page with no shape outlines interfering with the overlap check.
     if pending_callouts:
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
-        placed_boxes: List[fitz.Rect] = []
+        # Seed with shape bounding boxes so callouts won't overlap fills/circles.
+        placed_boxes: List[fitz.Rect] = list(shape_rects)
         for item in pending_callouts:
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
