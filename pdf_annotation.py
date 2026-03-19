@@ -531,16 +531,12 @@ def place_callout_annotation(
         callout=[attach, tip]        # 2-point leader: box edge → marker centre
     )
     annot.set_border(width=0.75)
-    # Colors must also be passed to update() — calling update() without them
-    # regenerates the appearance stream from viewer defaults, discarding the
-    # colors set at creation time.
-    annot.update(
-        fontsize=font_size,
-        fontname="Helvetica",
-        fill_color=(0, 0, 0),
-        border_color=(0, 0, 0),
-        text_color=(1, 1, 1),
-    )
+    # update() with no colour args is correct for PyMuPDF 1.23.x.
+    # Colors are stored in the annotation dict (/DA, /IC, /C) by
+    # add_freetext_annot(); update() reads them back when rebuilding
+    # the appearance stream.  Passing color kwargs to update() raises
+    # TypeError in this version and silently suppresses the annotation.
+    annot.update()
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
@@ -612,7 +608,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 # Apply transparent property if present
                 if obj.get("properties", {}).get("transparent") is True:
                     config["fill_opacity"] = 0
-                overlay = obj.get("overlay")
+                overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
                 objects_drawn += 1
 
