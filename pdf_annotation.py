@@ -24,9 +24,9 @@ from PIL import Image, ImageChops
 ANNOTATION_CONFIG = {
     "polygon": {
         "fill_color": (1, 0, 0),      # Red (RGB normalized 0-1)
-        "fill_opacity": 0.2,
+        "fill_opacity": 0.3,
         "stroke_color": (1, 0, 0),
-        "stroke_width": 1,
+        "stroke_width": 2,
         "stroke_opacity": 1.0
     },
     "marker": {
@@ -38,9 +38,9 @@ ANNOTATION_CONFIG = {
     },
     "square": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.25,
+        "fill_opacity": 0.3,
         "stroke_color": (1, 0, 0),
-        "stroke_width": 1,
+        "stroke_width": 2,
         "stroke_opacity": 1.0
     },
     "text": {
