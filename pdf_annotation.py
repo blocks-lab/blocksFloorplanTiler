@@ -207,60 +207,16 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
         pdf_points.append(fitz.Point(x_pdf, y_pdf))
 
-    # Draw filled polygon
+    # DEBUG: draw a circle at the centroid instead of the polygon shape
+    # to verify coordinate transformation is correct
     if len(pdf_points) >= 3:
+        centroid_x = sum(p.x for p in pdf_points) / len(pdf_points)
+        centroid_y = sum(p.y for p in pdf_points) / len(pdf_points)
         shape = page.new_shape()
-        shape.draw_polygon(pdf_points)
-        shape.finish(
-            fill=config["fill_color"],
-            color=config["stroke_color"],
-            width=config["stroke_width"],
-            fill_opacity=config["fill_opacity"],
-            stroke_opacity=config.get("stroke_opacity", 1.0)
-        )
+        shape.draw_circle(fitz.Point(centroid_x, centroid_y), 10)
+        shape.finish(fill=(0, 0, 1), color=(0, 0, 0), width=2, fill_opacity=1.0)
         shape.commit()
-        logging.info(f"✅ Polygon drawn!")
-
-        # Draw overlay text at the polygon centroid if provided
-        if overlay:
-            # Calculate centroid of the polygon
-            sum_x = sum(p.x for p in pdf_points)
-            sum_y = sum(p.y for p in pdf_points)
-            centroid_x = sum_x / len(pdf_points)
-            centroid_y = sum_y / len(pdf_points)
-
-            # Draw the overlay text centered at the centroid
-            font_size = 10
-            padding = 2
-            text_width = fitz.get_text_length(overlay, fontsize=font_size)
-            text_height = font_size
-
-            # Draw white background
-            bg_rect = fitz.Rect(
-                centroid_x - text_width / 2 - padding,
-                centroid_y - text_height / 2 - padding,
-                centroid_x + text_width / 2 + padding,
-                centroid_y + text_height / 2 + padding
-            )
-            bg_shape = page.new_shape()
-            bg_shape.draw_rect(bg_rect)
-            bg_shape.finish(
-                fill=(1, 1, 1),  # White background
-                fill_opacity=1.0  # Solid
-            )
-            bg_shape.commit()
-
-            # Draw text on top
-            text_x = centroid_x - text_width / 2
-            text_y = centroid_y + font_size / 3
-
-            page.insert_text(
-                fitz.Point(text_x, text_y),
-                overlay,
-                fontsize=font_size,
-                color=(0, 0, 0)  # Black text
-            )
-            logging.info(f"✅ Polygon overlay text drawn: '{overlay}'")
+        logging.info(f"✅ DEBUG polygon centroid circle at ({centroid_x:.1f}, {centroid_y:.1f})")
     else:
         logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
 
