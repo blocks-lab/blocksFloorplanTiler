@@ -603,18 +603,20 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             logging.info(f"Type: {obj_type}, Geometry: {geo_type}")
 
-            if obj_type == "rectangle" or obj_type == "square" or geo_type == "Polygon":
-                config = ANNOTATION_CONFIG.get("square" if obj_type == "square" else "polygon").copy()
+            if geo_type == "Polygon":
+                config = ANNOTATION_CONFIG["polygon"].copy()
                 # Apply transparent property if present
-                if obj.get("properties", {}).get("transparent") is True:
+                transparent = obj.get("properties", {}).get("transparent") is True
+                if transparent:
                     config["fill_opacity"] = 0
+                    logging.info(f"   transparent=True — fill will be invisible")
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
+                logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
                 objects_drawn += 1
 
-            elif obj_type == "marker" or geo_type == "Point":
+            elif geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"].copy()
-                # Apply transparent property if present
                 if obj.get("properties", {}).get("transparent") is True:
                     config["fill_opacity"] = 0
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
