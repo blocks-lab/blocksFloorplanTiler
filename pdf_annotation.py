@@ -599,14 +599,14 @@ def place_callout_annotation(
 #   Cell:  170 × 65 pt  →  total footprint ≈ 510 × 325 pt
 #
 # Variant index (V01–V15) → configuration:
-#   Row 1 – baseline + update() ordering
+#   Row 1 – baseline + update(text_color) ordering
 #     V01  baseline: fill=black, text=white, no mutation
-#     V02  update(border_color=Y) then bare update()  [does update() undo it?]
-#     V03  bare update() first, then update(border_color=Y)  [reverse order]
-#   Row 2 – update() method
-#     V04  update(border_color=(1,1,0))
-#     V05  update(text_color=(1,1,0))  [docs: same effect as border_color]
-#     V06  update(border_color=(1,1,0), text_color=(1,1,0))
+#     V02  update(text_color=Y) then bare update()
+#     V03  bare update() first, then update(text_color=Y)
+#   Row 2 – update() fill_color and text_color
+#     V04  update(text_color=Y)
+#     V05  update(fill_color=Y)  [yellow box]
+#     V06  update(text_color=Y) + update(fill_color=Y)
 #   Row 3 – set_colors()
 #     V07  set_colors(stroke=(1,1,0))   — no update
 #     V08  set_colors(stroke=(1,1,0)) + update()
@@ -632,29 +632,29 @@ def _diag_callout_variants(page: fitz.Page) -> None:
 
     # (id, description, ctor_extra_kwargs, post_actions)
     # post_actions are string tokens processed in order below.
-    # NOTE: border_color is NOT a valid ctor param when rich_text=False —
-    #       PyMuPDF raises ValueError. Tested via post-actions only.
+    # NOTE: border_color raises ValueError (rich_text=False) in BOTH ctor and
+    #       update() — it is completely unavailable without rich_text mode.
     VARIANTS = [
-        # Row 1 – baseline + update() ordering
-        ("V01", "baseline\n(no color args)",         {},                    []),
-        ("V02", "upd_bc_Y\nthen update()",           {},                    ["upd_bc_Y", "update"]),   # does bare update() undo bc?
-        ("V03", "update()\nthen upd_bc_Y",           {},                    ["update", "upd_bc_Y"]),   # reverse order
-        # Row 2 – update() method
-        ("V04", "update(\nborder_color=Y)",          {},                    ["upd_bc_Y"]),
-        ("V05", "update(\ntext_color=Y)",            {},                    ["upd_tc_Y"]),
-        ("V06", "update(bc=Y\n+ tc=Y)",              {},                    ["upd_bc_Y", "upd_tc_Y"]),
+        # Row 1 – baseline + update(text_color) ordering
+        ("V01", "baseline\n(no mutation)",            {},                       []),
+        ("V02", "upd(tc=Y)\nthen update()",           {},                       ["upd_tc_Y", "update"]),
+        ("V03", "update()\nthen upd(tc=Y)",           {},                       ["update", "upd_tc_Y"]),
+        # Row 2 – update() fill_color and text_color
+        ("V04", "update(\ntext_color=Y)",             {},                       ["upd_tc_Y"]),
+        ("V05", "update(\nfill_color=Y)",             {},                       ["upd_fill_Y"]),
+        ("V06", "upd(tc=Y)\n+ upd(fill=Y)",          {},                       ["upd_tc_Y", "upd_fill_Y"]),
         # Row 3 – set_colors()
-        ("V07", "set_colors(Y)\nno update",          {},                    ["sc_stroke_Y"]),
-        ("V08", "set_colors(Y)\n+ update()",         {},                    ["sc_stroke_Y", "update"]),
-        ("V09", "set_colors(Y)\n+ upd(fill=K)",      {},                    ["sc_stroke_Y", "upd_fill_K"]),
+        ("V07", "set_colors(Y)\nno update",           {},                       ["sc_stroke_Y"]),
+        ("V08", "set_colors(Y)\n+ update()",          {},                       ["sc_stroke_Y", "update"]),
+        ("V09", "set_colors(Y)\n+ upd(fill=K)",       {},                       ["sc_stroke_Y", "upd_fill_K"]),
         # Row 4 – xref_set_key direct PDF dict
-        ("V10", "xref C=Y\nno update",               {},                    ["xref_C_Y"]),
-        ("V11", "xref C=Y\n+ update()",              {},                    ["xref_C_Y", "update"]),
-        ("V12", "xref C=Y\n+ upd(fill=K)",           {},                    ["xref_C_Y", "upd_fill_K"]),
+        ("V10", "xref C=Y\nno update",                {},                       ["xref_C_Y"]),
+        ("V11", "xref C=Y\n+ update()",               {},                       ["xref_C_Y", "update"]),
+        ("V12", "xref C=Y\n+ upd(fill=K)",            {},                       ["xref_C_Y", "upd_fill_K"]),
         # Row 5 – combined / edge cases
-        ("V13", "sc(Y)+xref C=G\n+ upd (green?)",   {},                    ["sc_stroke_Y", "xref_C_G", "update"]),
-        ("V14", "xref C=Y\n+xref IC=K+upd",         {},                    ["xref_C_Y", "xref_IC_K", "update"]),  # both C and IC via xref
-        ("V15", "fill=BLUE\nxref C=Y+upd",          {"fill_color": (0, 0, 1)}, ["xref_C_Y", "update"]),
+        ("V13", "sc(Y)+xref C=G\n+ upd (green?)",    {},                       ["sc_stroke_Y", "xref_C_G", "update"]),
+        ("V14", "xref C=Y\n+xref IC=K+upd",          {},                       ["xref_C_Y", "xref_IC_K", "update"]),
+        ("V15", "fill=BLUE\nxref C=Y+upd",           {"fill_color": (0, 0, 1)}, ["xref_C_Y", "update"]),
     ]
 
     shape = page.new_shape()
@@ -689,8 +689,8 @@ def _diag_callout_variants(page: fitz.Page) -> None:
                 annot.update()
             elif action == "upd_fill_K":
                 annot.update(fill_color=(0, 0, 0))
-            elif action == "upd_bc_Y":
-                annot.update(border_color=(1, 1, 0))
+            elif action == "upd_fill_Y":
+                annot.update(fill_color=(1, 1, 0))
             elif action == "upd_tc_Y":
                 annot.update(text_color=(1, 1, 0))
             elif action == "sc_stroke_Y":
