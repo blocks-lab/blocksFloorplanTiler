@@ -23,24 +23,24 @@ from PIL import Image, ImageChops
 # Annotation styling
 ANNOTATION_CONFIG = {
     "polygon": {
-        "fill_color": (1, 0, 0),      # Red (RGB normalized 0-1)
-        "fill_opacity": 0.3,
-        "stroke_color": (1, 0, 0),
-        "stroke_width": 2,
+        "fill_color": (1, 0, 0),
+        "fill_opacity": 0.4,
+        "stroke_color": (0.8, 0, 0),
+        "stroke_width": 3,
         "stroke_opacity": 1.0
     },
     "marker": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.8,
-        "radius": 8,
+        "fill_opacity": 1.0,
+        "radius": 10,
         "stroke_color": (0, 0, 0),
-        "stroke_width": 5
+        "stroke_width": 2
     },
     "square": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.3,
-        "stroke_color": (1, 0, 0),
-        "stroke_width": 2,
+        "fill_opacity": 0.4,
+        "stroke_color": (0.8, 0, 0),
+        "stroke_width": 3,
         "stroke_opacity": 1.0
     },
     "text": {
