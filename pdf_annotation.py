@@ -183,7 +183,8 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                        overlay: str = None,
                        trim_offset: Tuple[float, float] = (0.0, 0.0),
                        pending_callouts: List = None,
-                       shape_rects: List = None) -> None:
+                       shape_rects: List = None,
+                       polygon_rects: List = None) -> None:
     """
     Draw a filled polygon on the PDF page, optionally with centered overlay text.
 
@@ -232,7 +233,12 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         if shape_rects is not None:
             xs = [p.x for p in pdf_points]
             ys = [p.y for p in pdf_points]
-            shape_rects.append(fitz.Rect(min(xs), min(ys), max(xs), max(ys)))
+            poly_bbox = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+            shape_rects.append(poly_bbox)
+            # Also track in the hard-exclusion list so callouts from OTHER
+            # markers are never placed on top of this polygon's fill area.
+            if polygon_rects is not None:
+                polygon_rects.append(poly_bbox)
 
         # Queue a deferred callout whose arrow tip points at the polygon centroid.
         # Use circumradius (max centroid→vertex distance) so the text box is
@@ -415,7 +421,8 @@ def place_callout_annotation(
         font_size: float = 9.0,
         box_width: float = 130.0,
         gap: float = 15.0,
-        polygon_points: List[fitz.Point] = None) -> None:
+        polygon_points: List[fitz.Point] = None,
+        forbidden_rects: List[fitz.Rect] = None) -> None:
     """
     Add a Callout FreeText annotation.
 
@@ -488,9 +495,12 @@ def place_callout_annotation(
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower overlap area = better
 
-    # Try three expanding distance multipliers before giving up.
-    # Pushing boxes further out resolves crowded areas without moving the arrow tip.
-    for dist_mult in (1.0, 1.5, 2.0):
+    # Each already-placed rect is expanded by this many points on every side
+    # before the overlap check so callout boxes always have breathing room.
+    MARGIN = 6.0
+
+    # Try expanding distance multipliers; more steps = better escape in crowded layouts.
+    for dist_mult in (1.0, 1.5, 2.0, 2.75, 3.75):
         effective_dist = min_dist * dist_mult
 
         for dx, dy in DIRS:
@@ -515,10 +525,23 @@ def place_callout_annotation(
             if not page_rect.contains(candidate):
                 continue
 
-            # Compute total overlap area with already-placed boxes
+            # Hard exclusion: polygon fill areas must never be covered.
+            # Any intersection (even tiny) gives infinite penalty so the
+            # algorithm always prefers a position clear of polygon fills.
+            if forbidden_rects:
+                forbidden = False
+                for frect in forbidden_rects:
+                    if not (candidate & frect).is_empty:
+                        forbidden = True
+                        break
+                if forbidden:
+                    continue  # skip — try next direction / distance
+
+            # Compute total overlap area against already-placed boxes + margin
             overlap = 0.0
             for placed in placed_boxes:
-                inter = candidate & placed
+                padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
+                inter = candidate & padded
                 if not inter.is_empty:
                     overlap += inter.width * inter.height
 
@@ -528,6 +551,39 @@ def place_callout_annotation(
 
         if best_score == 0.0:
             break  # perfect placement found — no need to try larger distances
+
+    # ── Fallback: if ALL positions intersect a forbidden rect, relax the hard
+    # exclusion and just pick the minimum-overlap position (better than nothing).
+    if best_rect is None and forbidden_rects:
+        for dist_mult in (1.0, 1.5, 2.0, 2.75, 3.75):
+            effective_dist = min_dist * dist_mult
+            for dx, dy in DIRS:
+                if dx > 0:
+                    bx0 = marker_x + effective_dist
+                elif dx < 0:
+                    bx0 = marker_x - effective_dist - box_width
+                else:
+                    bx0 = marker_x - box_width / 2
+                if dy > 0:
+                    by0 = marker_y + effective_dist
+                elif dy < 0:
+                    by0 = marker_y - effective_dist - box_height
+                else:
+                    by0 = marker_y - box_height / 2
+                candidate = fitz.Rect(bx0, by0, bx0 + box_width, by0 + box_height)
+                if not page_rect.contains(candidate):
+                    continue
+                overlap = 0.0
+                for placed in placed_boxes:
+                    padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
+                    inter = candidate & padded
+                    if not inter.is_empty:
+                        overlap += inter.width * inter.height
+                if overlap < best_score:
+                    best_score = overlap
+                    best_rect = candidate
+            if best_score == 0.0:
+                break
 
     if best_rect is None:
         # All directions at all distances clipped by page bounds — clamp to right edge
@@ -579,7 +635,7 @@ def place_callout_annotation(
         fontsize=font_size,
         fontname="helv",
         fill_color=(0, 0, 0),        # black box background
-        text_color=(0, 0, 0.6),      # dark blue → controls text, box border AND arrow line
+        text_color=(1, 0.5, 0),      # orange → controls text, box border AND leader line
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_NONE,
@@ -770,6 +826,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # so the layout algorithm can avoid them properly.
     pending_callouts: List[Tuple[float, float, float, str]] = []
     shape_rects: List[fitz.Rect] = []   # bounding rects of all burned shapes
+    polygon_rects: List[fitz.Rect] = [] # hard-exclusion zones (polygon fills)
     objects_drawn = 0
     for i, obj in enumerate(objects):
         try:
@@ -785,7 +842,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 config = ANNOTATION_CONFIG["polygon"].copy()
                 overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
                 logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}")
-                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects)
+                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects)
                 objects_drawn += 1
 
             elif geo_type == "Point":
@@ -813,7 +870,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
             try:
-                place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts)
+                place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts, forbidden_rects=polygon_rects)
             except Exception as e:
                 logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
 
