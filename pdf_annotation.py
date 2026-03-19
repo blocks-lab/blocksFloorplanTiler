@@ -571,15 +571,18 @@ def place_callout_annotation(
         text,
         fontsize=font_size,
         fontname="helv",
-        fill_color=(0, 0, 0),        # black background
-        text_color=(1, 1, 1),        # white text (sets /DA appearance stream)
+        fill_color=(0, 0, 0),        # black background  → PDF /IC key
+        text_color=(1, 1, 1),        # white text        → /DA appearance string
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
-    # border_color in update() sets the PDF /C key (callout line + box border stroke)
-    # separately from the /DA appearance stream text color set in the constructor above.
-    annot.update(border_color=(1, 1, 0))
+    # Set callout line + box border color to yellow by writing the PDF /C key directly.
+    # update(border_color=...) only changes /DA (text color) — same as text_color —
+    # it never touches /C.  xref_set_key is the only reliable path to /C for FreeText.
+    # The subsequent update() call (no color args) rebuilds the /AP stream reading /C.
+    page.parent.xref_set_key(annot.xref, "C", "[1 1 0]")
+    annot.update()
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
