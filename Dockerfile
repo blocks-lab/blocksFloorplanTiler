@@ -2,7 +2,8 @@
 # Optimized for Azure Container Apps deployment
 
 # Stage 1: Builder - Install dependencies
-FROM python:3.11-slim as builder
+# MCR mirror used to avoid Docker Hub unauthenticated pull rate limits in ACR builds
+FROM mcr.microsoft.com/mirror/docker/library/python:3.11-slim AS builder
 
 # Install system dependencies required for Pillow and PyMuPDF
 RUN apt-get update && apt-get install -y \
@@ -25,7 +26,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Runtime - Lightweight final image
-FROM python:3.11-slim
+FROM mcr.microsoft.com/mirror/docker/library/python:3.11-slim
 
 # Install runtime libraries only (smaller footprint)
 RUN apt-get update && apt-get install -y \
