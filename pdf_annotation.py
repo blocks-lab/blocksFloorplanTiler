@@ -489,8 +489,12 @@ def place_callout_annotation(
         fill_color=(1, 1, 0),        # yellow background — easy to spot in testing
         border_color=(0, 0, 0),
         text_color=(0, 0, 0),        # black text
+        callout=[attach, tip]        # leader line from box edge → marker centre
     )
-    annot.set_border(width=1.5)
+    # 3pt border makes both the box outline and the callout line clearly visible
+    annot.set_border(width=3.0)
+    # Open arrow at the tip so the line end is clearly identifiable at the marker
+    annot.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_OPEN_ARROW)
     annot.update()
 
     placed_boxes.append(best_rect)
@@ -601,6 +605,24 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"\n{'=' * 80}")
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
+
+    # Force all annotation appearance streams to be written correctly,
+    # then set NeedAppearances=false so PDF viewers (Acrobat) use our
+    # stored /AP streams instead of regenerating with their own defaults.
+    for annot in page.annots():
+        annot.update()
+
+    try:
+        cat_xref = doc.pdf_catalog()
+        acroform = doc.xref_get_key(cat_xref, "AcroForm")
+        if acroform[0] == "xref":
+            axref = int(acroform[1].split()[0])
+            doc.xref_set_key(axref, "NeedAppearances", "false")
+        else:
+            doc.xref_set_key(cat_xref, "AcroForm", "<</NeedAppearances false>>")
+        logging.info("✅ NeedAppearances set to false")
+    except Exception as na_err:
+        logging.warning(f"Could not set NeedAppearances=false: {na_err}")
 
     # Save to bytes
     output = io.BytesIO()
