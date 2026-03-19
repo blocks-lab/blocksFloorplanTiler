@@ -24,10 +24,10 @@ from PIL import Image, ImageChops
 ANNOTATION_CONFIG = {
     "polygon": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.4,
-        "stroke_color": (0.8, 0, 0),
-        "stroke_width": 3,
-        "stroke_opacity": 1.0
+        "fill_opacity": 0.25,
+        "stroke_color": None,
+        "stroke_width": 0,
+        "stroke_opacity": 0.0
     },
     "marker": {
         "fill_color": (1, 0, 0),
@@ -207,19 +207,9 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
         pdf_points.append(fitz.Point(x_pdf, y_pdf))
 
-    # DEBUG: draw a circle at the centroid instead of the polygon shape
-    # to verify coordinate transformation is correct
     if len(pdf_points) >= 3:
-        centroid_x = sum(p.x for p in pdf_points) / len(pdf_points)
-        centroid_y = sum(p.y for p in pdf_points) / len(pdf_points)
-        shape = page.new_shape()
-        shape.draw_circle(fitz.Point(centroid_x, centroid_y), 10)
-        shape.finish(fill=(0, 0, 1), color=(0, 0, 0), width=2, fill_opacity=1.0)
-        shape.commit()
-        logging.info(f"✅ DEBUG polygon centroid circle at ({centroid_x:.1f}, {centroid_y:.1f})")
-
-        # Draw the actual polygon using draw_polyline + closePath=True
-        # (Shape.draw_polygon does not exist in PyMuPDF 1.23.x)
+        # draw_polyline + closePath=True is the correct API for filled closed
+        # polygons in PyMuPDF 1.23.x (Shape.draw_polygon does not exist)
         shape = page.new_shape()
         shape.draw_polyline(pdf_points)
         shape.finish(
@@ -227,7 +217,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
             color=config["stroke_color"],
             width=config["stroke_width"],
             fill_opacity=config["fill_opacity"],
-            stroke_opacity=config.get("stroke_opacity", 1.0),
+            stroke_opacity=config.get("stroke_opacity", 0.0),
             closePath=True
         )
         shape.commit()
@@ -496,17 +486,12 @@ def place_callout_annotation(
         text,
         fontsize=font_size,
         fontname="Helvetica",
-        fill_color=(0, 0, 0),        # black background
+        fill_color=(1, 1, 0),        # yellow background — easy to spot in testing
         border_color=(0, 0, 0),
-        text_color=(1, 1, 1),        # white text
-        callout=[attach, tip]        # 2-point leader: box edge → marker centre
+        text_color=(0, 0, 0),        # black text
+        callout=[attach, tip]
     )
-    annot.set_border(width=0.75)
-    # update() with no colour args is correct for PyMuPDF 1.23.x.
-    # Colors are stored in the annotation dict (/DA, /IC, /C) by
-    # add_freetext_annot(); update() reads them back when rebuilding
-    # the appearance stream.  Passing color kwargs to update() raises
-    # TypeError in this version and silently suppresses the annotation.
+    annot.set_border(width=1.5)
     annot.update()
 
     placed_boxes.append(best_rect)
