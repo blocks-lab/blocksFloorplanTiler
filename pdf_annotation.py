@@ -506,7 +506,6 @@ def place_callout_annotation(
         fontname="helv",
         fill_color=(0, 0, 0),        # black background
         text_color=(1, 1, 1),        # white text
-        color=(0, 0, 0),             # black leader line + box border
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
