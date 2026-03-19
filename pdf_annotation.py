@@ -480,7 +480,10 @@ def place_callout_annotation(
     attach = fitz.Point(ax, ay)
     tip    = fitz.Point(marker_x, marker_y)
 
-    # ── Add the native PDF Callout FreeText annotation ────────────────────────
+    # ── Native PDF Callout FreeText annotation (movable/editable in Acrobat) ──
+    # Per official docs the callout tuple order is (tip, knee, attach) — i.e.
+    # far-to-near.  line_end and border_width must be passed to add_freetext_annot
+    # directly; calling set_line_ends() or set_border() afterward corrupts /AP.
     annot = page.add_freetext_annot(
         best_rect,
         text,
@@ -488,14 +491,12 @@ def place_callout_annotation(
         fontname="helv",
         fill_color=(1, 1, 0),        # yellow background — easy to spot in testing
         border_color=(0, 0, 0),
-        text_color=(0, 0, 0),        # black text
-        callout=[attach, tip]        # leader line from box edge → marker centre
+        text_color=(0, 0, 0),
+        border_width=1.5,
+        callout=[tip, attach],       # (arrowhead/far, box-edge/near) — far-to-near order
+        line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,  # passed here, NOT via set_line_ends
     )
-    # 3pt border makes both the box outline and the callout line clearly visible
-    annot.set_border(width=3.0)
-    # Open arrow at the tip so the line end is clearly identifiable at the marker
-    annot.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_OPEN_ARROW)
-    annot.update()
+    annot.update()                   # called exactly ONCE — no set_border / set_line_ends after this
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
