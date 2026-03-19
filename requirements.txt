@@ -7,7 +7,7 @@ uvicorn[standard]==0.27.0
 pydantic==2.5.3
 
 # PDF Processing
-PyMuPDF==1.23.8  # fitz - high-performance PDF rendering
+PyMuPDF>=1.25.3  # fitz - high-performance PDF rendering (>=1.25.3 required for FreeTextCallout support)
 pypdfium2==4.25.0  # PDF rendering for tile generation
 
 # Image Processing

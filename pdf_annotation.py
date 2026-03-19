@@ -480,23 +480,20 @@ def place_callout_annotation(
     attach = fitz.Point(ax, ay)
     tip    = fitz.Point(marker_x, marker_y)
 
-    # ── Native PDF Callout FreeText annotation (movable/editable in Acrobat) ──
-    # Per official docs the callout tuple order is (tip, knee, attach) — i.e.
-    # far-to-near.  line_end and border_width must be passed to add_freetext_annot
-    # directly; calling set_line_ends() or set_border() afterward corrupts /AP.
+    # ── Add the native PDF Callout FreeText annotation ────────────────────────
+    # Requires PyMuPDF >= 1.25.3 (FreeTextCallout subtype added in that version)
     annot = page.add_freetext_annot(
         best_rect,
         text,
         fontsize=font_size,
         fontname="helv",
-        fill_color=(1, 1, 0),        # yellow background — easy to spot in testing
-        border_color=(0, 0, 0),
-        text_color=(0, 0, 0),
+        fill_color=(0, 0, 0),        # black background
+        text_color=(1, 1, 1),        # white text
         border_width=1.5,
-        callout=[tip, attach],       # (arrowhead/far, box-edge/near) — far-to-near order
-        line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,  # passed here, NOT via set_line_ends
+        callout=[tip, attach],
+        line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
-    annot.update()                   # called exactly ONCE — no set_border / set_line_ends after this
+    annot.update()
 
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
@@ -607,10 +604,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Save to bytes — deflate=True compresses streams and is required for
-    # appearance streams to be written correctly into the output file.
+    # Save to bytes
     output = io.BytesIO()
-    doc.save(output, deflate=True)
+    doc.save(output)
     doc.close()
 
     return output.getvalue()
